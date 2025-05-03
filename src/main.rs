@@ -115,6 +115,9 @@ async fn proxy_handler(
         if let Some(ct) = headers.get(header::CONTENT_TYPE) {
             response_headers.insert(header::CONTENT_TYPE, ct.clone());
         }
+        // Allow access from any origin
+        response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+
         return Response::builder()
             .status(status)
             .body(axum::body::Body::from(body))
@@ -164,6 +167,29 @@ async fn proxy_handler(
                } else {
                  console.error('rrweb failed to load inside iframe.');
                }
+
+               // --- Navigation Interception ---
+               document.addEventListener('click', (event) => {
+                 let target = event.target;
+                 // Find the nearest ancestor anchor tag
+                 while (target && target.tagName !== 'A') {
+                     target = target.parentElement;
+                 }
+
+                 if (target && target.href) {
+                     // Prevent default navigation
+                     event.preventDefault();
+
+                     // Resolve the target URL (handles relative paths correctly)
+                     const targetUrl = new URL(target.href, window.location.href).href;
+                     
+                     console.log('Intercepted navigation to:', targetUrl);
+
+                     // Tell parent window to navigate the iframe via proxy
+                     window.parent.postMessage({ type: 'navigateProxy', url: targetUrl }, '*');
+                 }
+               }, true); // Use capture phase to catch clicks early
+
              });
            </script>
         "#
@@ -213,7 +239,19 @@ async fn proxy_handler(
         header::CONTENT_TYPE,
         "text/html; charset=utf-8".parse().unwrap(),
     );
+    // Add headers to prevent caching
+    final_headers.insert(
+        header::CACHE_CONTROL,
+        "no-store, no-cache, must-revalidate, proxy-revalidate"
+            .parse()
+            .unwrap(),
+    );
+    final_headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
+    final_headers.insert(header::EXPIRES, "0".parse().unwrap());
+    // Allow access from any origin for the HTML response as well
+    final_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
     // Add other desired headers here if needed
 
+    // Return the modified HTML with the cleaned headers
     (final_headers, Html(modified_html)).into_response()
 }

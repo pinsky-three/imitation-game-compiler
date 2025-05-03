@@ -144,6 +144,45 @@
             // Optional: Log other messages for debugging
             // console.log("Received non-rrweb message:", message);
           }
+
+          // Handle navigation requests from iframe
+          if (
+            message.data &&
+            message.data.type === "navigateProxy" &&
+            message.data.url
+          ) {
+            console.log(
+              "Parent received navigation request for:",
+              message.data.url
+            );
+            statusIndicator.textContent = "Status: Navigating...";
+            replayButton.disabled = true;
+            loadButton.disabled = true; // Also disable load during navigation
+            events = []; // Reset events for new page recording
+            isRecording = true;
+
+            // Clear previous replay
+            if (replayer) {
+              try {
+                replayer.destroy();
+              } catch (e) {
+                console.warn("Error destroying previous replayer:", e);
+              }
+              replayer = null;
+            }
+            replayContainer.innerHTML = "";
+
+            // Reload iframe via proxy
+            iframe.src = `/proxy?url=${encodeURIComponent(message.data.url)}`;
+
+            // Re-enable button after a delay (similar to initial load)
+            setTimeout(() => {
+              if (isRecording) {
+                statusIndicator.textContent = "Status: Recording";
+              }
+              loadButton.disabled = false;
+            }, 5000);
+          }
         });
 
         replayButton.addEventListener("click", () => {
