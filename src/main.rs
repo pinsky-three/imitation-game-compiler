@@ -5,13 +5,15 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use lol_html::html_content::ContentType;
+use lol_html::{ElementContentHandlers, HtmlRewriter, Settings, element};
 use reqwest::Client;
-use scraper::{Html as ScraperHtml, Node, Selector};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::fs;
 use url::Url;
+use urlencoding;
 
 #[derive(Deserialize)]
 struct ProxyParams {
@@ -58,6 +60,12 @@ async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ProxyParams>,
 ) -> impl IntoResponse {
+    // Thin wrapper that immediately delegates to a helper function
+    process_proxy_request(state, params).await
+}
+
+// Move all the complex processing to this helper function
+async fn process_proxy_request(state: Arc<AppState>, params: ProxyParams) -> Response {
     // Validate and parse the target URL
     let target_url = match Url::parse(&params.url) {
         Ok(url) => {
@@ -77,7 +85,7 @@ async fn proxy_handler(
             eprintln!("Failed to fetch {}: {}", target_url, e);
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch upstream URL: {}", e),
+                Html(format!("Failed to fetch upstream URL: {}", e)),
             )
                 .into_response();
         }
@@ -87,39 +95,31 @@ async fn proxy_handler(
     let content_type = fetch_res
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
+        .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
 
     if !content_type.contains("text/html") {
-        // If not HTML, try to stream the response directly
-        // Note: This is basic, might need more robust handling for different content types
+        // This path already builds and returns a Response directly.
         let original_headers = fetch_res.headers().clone();
         let status = fetch_res.status();
-        let body = fetch_res.bytes().await.unwrap_or_default(); // Consider streaming
-
-        // Create a new HeaderMap and copy only desired headers
+        let body = fetch_res.bytes().await.unwrap_or_default();
         let mut filtered_headers = HeaderMap::new();
         for (key, value) in original_headers.iter() {
             let lower_key = key.as_str().to_lowercase();
-            // Skip frame-blocking headers and potentially problematic encoding headers
             if lower_key != "x-frame-options"
                 && lower_key != "content-security-policy"
-                && lower_key != "content-encoding" // Avoid if we don't handle decompression
+                && lower_key != "content-encoding"
                 && lower_key != "transfer-encoding"
             {
                 filtered_headers.insert(key.clone(), value.clone());
             }
         }
-
-        // Crucially set the content-type header from the original response if available
         if let Some(ct) = original_headers.get(header::CONTENT_TYPE) {
             filtered_headers.insert(header::CONTENT_TYPE, ct.clone());
         }
-        // Allow access from any origin
         filtered_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
 
-        // Build the basic response
         let mut response = Response::builder()
             .status(status)
             .body(axum::body::Body::from(body))
@@ -129,12 +129,8 @@ async fn proxy_handler(
                     "Failed to build response",
                 )
                     .into_response()
-            });
-
-        // Apply the filtered headers
+            }); // Keep .into_response() inside closure
         *response.headers_mut() = filtered_headers;
-
-        // Debug: Print final headers being sent (non-HTML)
         println!("--- Sending non-HTML Response Headers ---");
         for (key, value) in response.headers() {
             println!(
@@ -144,113 +140,181 @@ async fn proxy_handler(
             );
         }
         println!("---------------------------------------");
-
-        return response.into_response();
+        return response; // Return the built Response
     }
 
-    // Read HTML content
+    // --- HTML Processing ---
+    // rewrite_html_response returns Response. Await and return it directly.
+    rewrite_html_response(fetch_res, target_url).await
+}
+
+// Helper function to rewrite URLs
+fn rewrite_url(url_str: &str, base_url: &Url) -> Result<String, url::ParseError> {
+    // Trim whitespace
+    let trimmed_url = url_str.trim();
+
+    // Ignore data URLs, javascript: URIs, and empty URLs
+    if trimmed_url.starts_with("data:")
+        || trimmed_url.starts_with("javascript:")
+        || trimmed_url.is_empty()
+    {
+        return Ok(trimmed_url.to_string());
+    }
+
+    // Try to parse the URL relative to the base URL
+    match base_url.join(trimmed_url) {
+        Ok(abs_url) => {
+            // If successful, rewrite it to go through the proxy
+            Ok(format!(
+                "/proxy?url={}",
+                urlencoding::encode(abs_url.as_str())
+            ))
+        }
+        Err(e) => {
+            // If parsing fails, return the original string (might be malformed)
+            // or handle the error differently if needed. Log the error.
+            eprintln!(
+                "Failed to parse/join URL '{}' relative to base '{}': {}",
+                trimmed_url, base_url, e
+            );
+            Err(e) // Propagate the error
+            // Alternatively, return original: Ok(trimmed_url.to_string())
+        }
+    }
+}
+
+// --- New function to handle HTML rewriting ---
+async fn rewrite_html_response(fetch_res: reqwest::Response, target_url: Url) -> Response {
+    // First, read the full HTML text from the response (this is the only await inside the function)
     let html_content = match fetch_res.text().await {
         Ok(text) => text,
         Err(e) => {
             eprintln!("Failed to read text from {}: {}", target_url, e);
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to read upstream response body: {}", e),
+                Html(format!("Failed to read upstream response body: {}", e)),
             )
                 .into_response();
         }
     };
 
-    // Parse HTML
-    let document = ScraperHtml::parse_document(&html_content);
-    let head_selector = Selector::parse("head").unwrap();
-    let body_selector = Selector::parse("body").unwrap();
+    // After this point, there will be NO further `.await`, so non-Send types won't cross await boundaries
 
-    // Inject rrweb script and communication script into <head>
+    let mut rewritten_html_bytes = Vec::new();
+
+    // Inject rrweb script
     let rrweb_script =
         r#"<script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
            <script>
              window.addEventListener('load', () => {
                if (typeof rrweb !== 'undefined') {
                  console.log('rrweb loaded in iframe, starting recording...');
-                 rrweb.record({ 
+                 rrweb.record({
                    emit(event) {
                      // Send event to parent window
                      window.parent.postMessage({ type: 'rrwebEvent', event: event }, '*');
                    },
-                   // Important: Disable canvas recording unless specifically handled
-                   recordCanvas: false, 
+                   recordCanvas: false,
                  });
                } else {
                  console.error('rrweb failed to load inside iframe.');
                }
-
                // --- Navigation Interception ---
                document.addEventListener('click', (event) => {
                  let target = event.target;
-                 // Find the nearest ancestor anchor tag
-                 while (target && target.tagName !== 'A') {
-                     target = target.parentElement;
-                 }
-
+                 while (target && target.tagName !== 'A') { target = target.parentElement; }
                  if (target && target.href) {
-                     // Prevent default navigation
-                     event.preventDefault();
-
-                     // Resolve the target URL (handles relative paths correctly)
-                     const targetUrl = new URL(target.href, window.location.href).href;
-                     
-                     console.log('Intercepted navigation to:', targetUrl);
-
-                     // Tell parent window to navigate the iframe via proxy
-                     window.parent.postMessage({ type: 'navigateProxy', url: targetUrl }, '*');
+                   event.preventDefault();
+                   const targetUrl = new URL(target.href, window.location.href).href;
+                   console.log('Intercepted navigation to:', targetUrl);
+                   window.parent.postMessage({ type: 'navigateProxy', url: targetUrl }, '*');
                  }
-               }, true); // Use capture phase to catch clicks early
-
+               }, true);
              });
            </script>
         "#
         .to_string();
-    // Inject a <base> tag to fix relative URLs
-    let base_tag = format!(
-        "<base href=\"{}/\">
-",
-        target_url.origin().unicode_serialization()
+
+    let base_href = target_url.origin().unicode_serialization();
+    let base_tag = format!("<base href=\"{}/\">\n", base_href);
+
+    let target_url_clone = target_url.clone();
+
+    let element_content_handlers = vec![
+        element!("head", |el| {
+            el.prepend(&base_tag, ContentType::Html);
+            el.append(&rrweb_script, ContentType::Html);
+            Ok(())
+        }),
+        element!("[href]", |el| {
+            if let Some(href) = el.get_attribute("href") {
+                if let Ok(rewritten) = rewrite_url(&href, &target_url_clone) {
+                    el.set_attribute("href", &rewritten)?;
+                }
+            }
+            Ok(())
+        }),
+        element!("[src]", |el| {
+            if let Some(src) = el.get_attribute("src") {
+                if let Ok(rewritten) = rewrite_url(&src, &target_url_clone) {
+                    el.set_attribute("src", &rewritten)?;
+                }
+            }
+            Ok(())
+        }),
+        element!("[srcset]", |el| {
+            if let Some(srcset) = el.get_attribute("srcset") {
+                // Full srcset handling
+                let rewritten_srcset = srcset
+                    .split(',')
+                    .map(|part| {
+                        let trimmed_part = part.trim();
+                        if let Some(url_end) = trimmed_part.find(' ') {
+                            let url_part = &trimmed_part[..url_end];
+                            let descriptor = &trimmed_part[url_end..];
+                            match rewrite_url(url_part, &target_url_clone) {
+                                Ok(rewritten_url) => format!("{} {}", rewritten_url, descriptor),
+                                Err(_) => trimmed_part.to_string(),
+                            }
+                        } else {
+                            match rewrite_url(trimmed_part, &target_url_clone) {
+                                Ok(rewritten_url) => rewritten_url,
+                                Err(_) => trimmed_part.to_string(),
+                            }
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                el.set_attribute("srcset", &rewritten_srcset)?;
+            }
+            Ok(())
+        }),
+        // TODO: Add more handlers
+    ];
+
+    let mut rewriter = HtmlRewriter::new(
+        Settings {
+            element_content_handlers,
+            ..Settings::default()
+        },
+        |c: &[u8]| rewritten_html_bytes.extend_from_slice(c),
     );
 
-    let mut modified_html = String::new();
-    // Reconstruct HTML carefully - Add a generic DOCTYPE
-    modified_html.push_str("<!DOCTYPE html>\n");
-    modified_html.push_str("<html>");
-
-    if let Some(head_node) = document.select(&head_selector).next() {
-        modified_html.push_str("<head>");
-        modified_html.push_str(&base_tag);
-        modified_html.push_str(&rrweb_script);
-        modified_html.push_str(&head_node.inner_html()); // Add original head content
-        modified_html.push_str("</head>");
-    } else {
-        // If no head, create one
-        modified_html.push_str("<head>");
-        modified_html.push_str(&base_tag);
-        modified_html.push_str(&rrweb_script);
-        modified_html.push_str("</head>");
+    // Run the rewriter synchronously (no await)
+    if let Err(e) = rewriter.write(html_content.as_bytes()) {
+        eprintln!("HTML rewriting error: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to rewrite HTML").into_response();
+    }
+    if let Err(e) = rewriter.end() {
+        eprintln!("HTML rewriting end error: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to finalize HTML rewriting",
+        )
+            .into_response();
     }
 
-    if let Some(body_node) = document.select(&body_selector).next() {
-        modified_html.push_str("<body>");
-        modified_html.push_str(&body_node.inner_html()); // Add original body content
-        modified_html.push_str("</body>");
-    } else {
-        modified_html.push_str("<body>");
-        // If no body tag, append the rest of the document content
-        modified_html.push_str(&document.html());
-        modified_html.push_str("</body>");
-    }
-
-    modified_html.push_str("</html>");
-
-    // Build headers for the final response
+    // Build headers and final Response (same as before)
     let mut final_headers = HeaderMap::new();
     final_headers.insert(
         header::CONTENT_TYPE,
@@ -266,16 +330,17 @@ async fn proxy_handler(
     final_headers.insert(header::EXPIRES, "0".parse().unwrap());
     final_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
 
-    // Construct the initial response part
-    let mut response = (final_headers, Html(modified_html)).into_response();
+    let final_html = String::from_utf8(rewritten_html_bytes).unwrap_or_else(|e| {
+        eprintln!("Rewritten HTML is not valid UTF-8: {}", e);
+        "Error: Rewritten content is not valid UTF-8".to_string()
+    });
+    let mut response = (final_headers, Html(final_html)).into_response();
 
-    // Explicitly remove frame-blocking headers JUST before returning
     response.headers_mut().remove(header::X_FRAME_OPTIONS);
     response
         .headers_mut()
         .remove(header::CONTENT_SECURITY_POLICY);
 
-    // Debug: Print final headers being sent (HTML)
     println!("--- Sending HTML Response Headers ---");
     for (key, value) in response.headers() {
         println!(
@@ -286,6 +351,6 @@ async fn proxy_handler(
     }
     println!("-----------------------------------");
 
-    // Return the modified HTML with the cleaned headers
     response
 }
+// --- End of new function ---
