@@ -94,31 +94,33 @@ async fn proxy_handler(
     if !content_type.contains("text/html") {
         // If not HTML, try to stream the response directly
         // Note: This is basic, might need more robust handling for different content types
-        let headers = fetch_res.headers().clone();
+        let original_headers = fetch_res.headers().clone();
         let status = fetch_res.status();
         let body = fetch_res.bytes().await.unwrap_or_default(); // Consider streaming
-        let mut response_headers = HeaderMap::new();
-        for (key, value) in headers.iter() {
-            // Avoid forwarding problematic headers like content-encoding if we aren't handling it
-            // Also remove frame-blocking headers
+
+        // Create a new HeaderMap and copy only desired headers
+        let mut filtered_headers = HeaderMap::new();
+        for (key, value) in original_headers.iter() {
             let lower_key = key.as_str().to_lowercase();
-            if lower_key != "content-encoding"
-                && lower_key != "transfer-encoding"
-                && lower_key != "x-frame-options"
+            // Skip frame-blocking headers and potentially problematic encoding headers
+            if lower_key != "x-frame-options"
                 && lower_key != "content-security-policy"
-            // Removing CSP entirely is broad, but simplest for now
+                && lower_key != "content-encoding" // Avoid if we don't handle decompression
+                && lower_key != "transfer-encoding"
             {
-                response_headers.insert(key.clone(), value.clone());
+                filtered_headers.insert(key.clone(), value.clone());
             }
         }
-        // Crucially set the content-type header from the original response
-        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
-            response_headers.insert(header::CONTENT_TYPE, ct.clone());
+
+        // Crucially set the content-type header from the original response if available
+        if let Some(ct) = original_headers.get(header::CONTENT_TYPE) {
+            filtered_headers.insert(header::CONTENT_TYPE, ct.clone());
         }
         // Allow access from any origin
-        response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+        filtered_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
 
-        return Response::builder()
+        // Build the basic response
+        let mut response = Response::builder()
             .status(status)
             .body(axum::body::Body::from(body))
             .unwrap_or_else(|_| {
@@ -127,8 +129,23 @@ async fn proxy_handler(
                     "Failed to build response",
                 )
                     .into_response()
-            })
-            .into_response();
+            });
+
+        // Apply the filtered headers
+        *response.headers_mut() = filtered_headers;
+
+        // Debug: Print final headers being sent (non-HTML)
+        println!("--- Sending non-HTML Response Headers ---");
+        for (key, value) in response.headers() {
+            println!(
+                "{}: {}",
+                key,
+                value.to_str().unwrap_or("[invalid header value]")
+            );
+        }
+        println!("---------------------------------------");
+
+        return response.into_response();
     }
 
     // Read HTML content
@@ -233,13 +250,12 @@ async fn proxy_handler(
 
     modified_html.push_str("</html>");
 
-    // Ensure frame-blocking headers are not present in the final response for HTML
+    // Build headers for the final response
     let mut final_headers = HeaderMap::new();
     final_headers.insert(
         header::CONTENT_TYPE,
         "text/html; charset=utf-8".parse().unwrap(),
     );
-    // Add headers to prevent caching
     final_headers.insert(
         header::CACHE_CONTROL,
         "no-store, no-cache, must-revalidate, proxy-revalidate"
@@ -248,10 +264,28 @@ async fn proxy_handler(
     );
     final_headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
     final_headers.insert(header::EXPIRES, "0".parse().unwrap());
-    // Allow access from any origin for the HTML response as well
     final_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
-    // Add other desired headers here if needed
+
+    // Construct the initial response part
+    let mut response = (final_headers, Html(modified_html)).into_response();
+
+    // Explicitly remove frame-blocking headers JUST before returning
+    response.headers_mut().remove(header::X_FRAME_OPTIONS);
+    response
+        .headers_mut()
+        .remove(header::CONTENT_SECURITY_POLICY);
+
+    // Debug: Print final headers being sent (HTML)
+    println!("--- Sending HTML Response Headers ---");
+    for (key, value) in response.headers() {
+        println!(
+            "{}: {}",
+            key,
+            value.to_str().unwrap_or("[invalid header value]")
+        );
+    }
+    println!("-----------------------------------");
 
     // Return the modified HTML with the cleaned headers
-    (final_headers, Html(modified_html)).into_response()
+    response
 }
