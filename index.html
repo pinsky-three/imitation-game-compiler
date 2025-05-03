@@ -1,148 +1,222 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <title>rrweb Test</title>
+    <title>rrweb Proxy Recorder</title>
     <link
       rel="stylesheet"
       href="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/style.css"
     />
-    <script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
+    <!-- rrweb script is NOT needed here anymore, it gets injected by the proxy -->
+    <!-- Include rrweb here for the Replayer on the main page -->
+    <script
+      src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"
+      defer
+    ></script>
     <style>
       body {
         display: flex;
         flex-direction: column;
-        align-items: center;
+        height: 100vh;
+        margin: 0;
         font-family: sans-serif;
       }
+      .controls {
+        padding: 10px;
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        border-bottom: 1px solid #ccc;
+      }
+      .controls input[type="url"] {
+        flex-grow: 1;
+        padding: 5px;
+      }
+      .content-area {
+        display: flex;
+        flex-grow: 1;
+        height: calc(100% - 60px); /* Adjust based on control height */
+      }
+      #iframe-container {
+        flex-basis: 60%;
+        border-right: 1px solid #ccc;
+        overflow: hidden;
+      }
+      #target-iframe {
+        width: 100%;
+        height: 100%;
+        border: none;
+      }
       #replay-container {
-        margin-top: 20px;
-        width: 800px;
-        height: 600px;
-        border: 1px solid #ccc;
+        flex-basis: 40%;
         background: #f0f0f0;
+        overflow: auto;
       }
       button {
-        margin-top: 10px;
-        padding: 10px 20px;
-        font-size: 16px;
+        padding: 5px 10px;
       }
     </style>
   </head>
   <body>
-    <h1>rrweb Test Page</h1>
-    <p>
-      Interact with this page (e.g., click, type in the input field) and then
-      click "Replay Recording".
-    </p>
+    <div class="controls">
+      <label for="url-input">URL:</label>
+      <input type="url" id="url-input" placeholder="https://example.com" />
+      <button id="load-button">Load & Record</button>
+      <button id="replay-button" disabled>Replay Recording</button>
+      <span id="status-indicator" style="margin-left: auto">Status: Idle</span>
+    </div>
 
-    <label for="test-input">Test Input:</label>
-    <input type="text" id="test-input" placeholder="Type something here..." />
-
-    <button id="start-button">Start Recording</button>
-    <button id="stop-button" disabled>Stop Recording</button>
-    <button id="replay-button" disabled>Replay Recording</button>
-
-    <div id="replay-container"></div>
+    <div class="content-area">
+      <div id="iframe-container">
+        <iframe id="target-iframe" title="Target Website"></iframe>
+      </div>
+      <div id="replay-container"></div>
+    </div>
 
     <script>
       window.addEventListener("load", function () {
         let events = [];
-        let stopFn = null;
         let replayer = null;
+        let isRecording = false;
 
-        // Get buttons
-        const startButton = document.getElementById("start-button");
-        const stopButton = document.getElementById("stop-button");
+        // Get elements
+        const urlInput = document.getElementById("url-input");
+        const loadButton = document.getElementById("load-button");
         const replayButton = document.getElementById("replay-button");
-
-        // Log the rrweb object to check if it's loaded
-        console.log("Checking window.rrweb:", window.rrweb);
-
-        // Check if rrweb loaded successfully
-        if (typeof rrweb === "undefined") {
-          console.error("rrweb is not loaded. Recording/Replay disabled.");
-          alert("Error: rrweb library failed to load. Cannot start recording.");
-          startButton.disabled = true;
-          return;
-        }
+        const iframe = document.getElementById("target-iframe");
+        const replayContainer = document.getElementById("replay-container");
+        const statusIndicator = document.getElementById("status-indicator");
 
         // --- Event Listeners ---
 
-        startButton.addEventListener("click", () => {
-          if (stopFn) {
-            console.log("Recording already in progress.");
-            return; // Already recording
+        loadButton.addEventListener("click", () => {
+          const targetUrl = urlInput.value;
+          if (!targetUrl) {
+            alert("Please enter a URL.");
+            return;
           }
-          events = []; // Clear previous events
-          console.log("Starting rrweb recording...");
-          try {
-            stopFn = rrweb.record({
-              emit(event) {
-                // push event into the events array
-                console.log("event recorded:", event);
-                events.push(event);
-              },
-              // Removed maskAllInputs: true
-            });
-            console.log("rrweb recording started.");
-            startButton.disabled = true;
-            stopButton.disabled = false;
-            replayButton.disabled = true; // Disable replay while recording
-          } catch (error) {
-            console.error("Failed to start rrweb recording:", error);
-            alert("Error initializing recorder. Check console.");
+
+          console.log(`Loading ${targetUrl} via proxy...`);
+          statusIndicator.textContent = "Status: Loading...";
+          replayButton.disabled = true;
+          loadButton.disabled = true; // Disable while loading
+          events = []; // Reset events for new recording
+          isRecording = true; // Assume recording starts once loaded via proxy
+
+          // Clear previous replay
+          if (replayer) {
+            try {
+              replayer.destroy();
+            } catch (e) {
+              console.warn("Error destroying previous replayer:", e);
+            }
+            replayer = null;
           }
+          replayContainer.innerHTML = "";
+
+          // Load URL via our proxy
+          iframe.src = `/proxy?url=${encodeURIComponent(targetUrl)}`;
+
+          // Re-enable button after a delay in case loading hangs (basic handling)
+          setTimeout(() => {
+            if (isRecording) {
+              // Only update status if still in loading state
+              statusIndicator.textContent = "Status: Recording";
+            }
+            loadButton.disabled = false;
+          }, 5000); // Re-enable after 5s, adjust as needed
         });
 
-        stopButton.addEventListener("click", () => {
-          if (!stopFn) {
-            console.log("Recording is not currently active.");
-            return; // Not recording
+        // Listen for messages (events) from the iframe
+        window.addEventListener("message", (message) => {
+          // Basic security check: Ensure message is structured as expected
+          if (
+            message.data &&
+            message.data.type === "rrwebEvent" &&
+            message.data.event
+          ) {
+            if (isRecording) {
+              // console.log("Received rrweb event from iframe:", message.data.event);
+              events.push(message.data.event);
+              replayButton.disabled = false; // Enable replay once we have events
+              statusIndicator.textContent = "Status: Recording"; // Update status on first event
+            }
+          } else {
+            // Optional: Log other messages for debugging
+            // console.log("Received non-rrweb message:", message);
           }
-          console.log("Stopping rrweb recording...");
-          stopFn();
-          stopFn = null;
-          console.log("rrweb recording stopped.");
-          startButton.disabled = false;
-          stopButton.disabled = true;
-          replayButton.disabled = events.length < 2; // Enable replay only if events exist
         });
 
         replayButton.addEventListener("click", () => {
-          if (stopFn) {
-            console.warn("Please stop recording before replaying.");
-            alert("Please stop recording before replaying.");
-            return;
-          }
           if (events.length < 2) {
-            console.log(
-              "Not enough events recorded yet or recording not started/stopped."
-            );
             alert(
-              "Please start and stop recording first, and interact with the page."
+              "Not enough events recorded, or recording hasn't started successfully in the iframe."
             );
             return;
           }
-
-          // Clear previous replay if any
-          const replayContainer = document.getElementById("replay-container");
-          replayContainer.innerHTML = ""; // Clear the container
+          isRecording = false; // Stop considering new events for this replay
+          statusIndicator.textContent = "Status: Replaying...";
+          loadButton.disabled = true; // Disable load during replay
+          replayButton.disabled = true; // Disable replay during replay
 
           console.log(`Replaying ${events.length} events.`);
 
-          replayer = new rrweb.Replayer(events, {
-            root: replayContainer, // Specify the container element for replay
-            skipInactive: true,
-          });
-
-          replayer.on("finish", () => {
-            console.log("Replay finished.");
-          });
+          // Clear previous replay if any
+          if (replayer) {
+            try {
+              replayer.destroy();
+            } catch (e) {
+              console.warn("Error destroying previous replayer:", e);
+            }
+            replayer = null;
+          }
+          replayContainer.innerHTML = "";
 
           try {
+            // We need rrweb loaded in THIS window for the Replayer
+            // Ensure the script is included if needed for replay, or use rrwebPlayer
+            if (
+              typeof rrweb === "undefined" ||
+              typeof rrweb.Replayer === "undefined"
+            ) {
+              alert(
+                "Error: rrweb Replayer is not available in the main window. Cannot replay."
+              );
+              console.error(
+                "rrweb or rrweb.Replayer not found in main window."
+              );
+              statusIndicator.textContent = "Status: Replay Failed";
+              loadButton.disabled = false;
+              // Re-enable replay button maybe? Depends on desired logic
+              replayButton.disabled = events.length < 2;
+              return;
+            }
+
+            replayer = new rrweb.Replayer(events, {
+              root: replayContainer,
+              skipInactive: true,
+            });
+
+            replayer.on("finish", () => {
+              console.log("Replay finished.");
+              statusIndicator.textContent = "Status: Replay Finished";
+              loadButton.disabled = false;
+              replayButton.disabled = events.length < 2;
+            });
+
+            replayer.on("destroy", () => {
+              replayer = null; // Clean up reference
+            });
+
             replayer.play();
           } catch (error) {
-            console.error("Error during replay:", error);
+            console.error(
+              "Error during replay initialization or playback:",
+              error
+            );
+            alert("An error occurred during replay. Check console.");
+            statusIndicator.textContent = "Status: Replay Failed";
+            loadButton.disabled = false;
+            replayButton.disabled = events.length < 2;
           }
         });
       });
