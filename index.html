@@ -38,7 +38,9 @@
     <label for="test-input">Test Input:</label>
     <input type="text" id="test-input" placeholder="Type something here..." />
 
-    <button id="replay-button">Replay Recording</button>
+    <button id="start-button">Start Recording</button>
+    <button id="stop-button" disabled>Stop Recording</button>
+    <button id="replay-button" disabled>Replay Recording</button>
 
     <div id="replay-container"></div>
 
@@ -48,63 +50,101 @@
         let stopFn = null;
         let replayer = null;
 
+        // Get buttons
+        const startButton = document.getElementById("start-button");
+        const stopButton = document.getElementById("stop-button");
+        const replayButton = document.getElementById("replay-button");
+
         // Log the rrweb object to check if it's loaded
         console.log("Checking window.rrweb:", window.rrweb);
 
-        // Start recording immediately
-        try {
-          stopFn = rrweb.record({
-            emit(event) {
-              // push event into the events array
-              console.log("event recorded:", event);
-              events.push(event);
-            },
-            // Optional: mask input fields for privacy
-            maskAllInputs: true,
-          });
-          console.log("rrweb recording started.");
-        } catch (error) {
-          console.error("Failed to start rrweb recording:", error);
-          alert("Error initializing recorder. Check console.");
-          return; // Don't proceed if recording failed to start
+        // Check if rrweb loaded successfully
+        if (typeof rrweb === "undefined") {
+          console.error("rrweb is not loaded. Recording/Replay disabled.");
+          alert("Error: rrweb library failed to load. Cannot start recording.");
+          startButton.disabled = true;
+          return;
         }
 
-        document
-          .getElementById("replay-button")
-          .addEventListener("click", () => {
-            if (events.length < 2) {
-              console.log("Not enough events recorded yet.");
-              alert("Please interact with the page first before replaying.");
-              return;
-            }
+        // --- Event Listeners ---
 
-            if (stopFn) {
-              stopFn(); // Stop recording if it's still running
-              console.log("rrweb recording stopped.");
-              stopFn = null;
-            }
-
-            // Clear previous replay if any
-            const replayContainer = document.getElementById("replay-container");
-            replayContainer.innerHTML = ""; // Clear the container
-
-            console.log(`Replaying ${events.length} events.`);
-
-            replayer = new rrweb.Replayer(events, {
-              root: replayContainer, // Specify the container element for replay
-              skipInactive: true,
+        startButton.addEventListener("click", () => {
+          if (stopFn) {
+            console.log("Recording already in progress.");
+            return; // Already recording
+          }
+          events = []; // Clear previous events
+          console.log("Starting rrweb recording...");
+          try {
+            stopFn = rrweb.record({
+              emit(event) {
+                // push event into the events array
+                console.log("event recorded:", event);
+                events.push(event);
+              },
+              // Removed maskAllInputs: true
             });
+            console.log("rrweb recording started.");
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            replayButton.disabled = true; // Disable replay while recording
+          } catch (error) {
+            console.error("Failed to start rrweb recording:", error);
+            alert("Error initializing recorder. Check console.");
+          }
+        });
 
-            replayer.on("finish", () => {
-              console.log("Replay finished.");
-            });
+        stopButton.addEventListener("click", () => {
+          if (!stopFn) {
+            console.log("Recording is not currently active.");
+            return; // Not recording
+          }
+          console.log("Stopping rrweb recording...");
+          stopFn();
+          stopFn = null;
+          console.log("rrweb recording stopped.");
+          startButton.disabled = false;
+          stopButton.disabled = true;
+          replayButton.disabled = events.length < 2; // Enable replay only if events exist
+        });
 
-            try {
-              replayer.play();
-            } catch (error) {
-              console.error("Error during replay:", error);
-            }
+        replayButton.addEventListener("click", () => {
+          if (stopFn) {
+            console.warn("Please stop recording before replaying.");
+            alert("Please stop recording before replaying.");
+            return;
+          }
+          if (events.length < 2) {
+            console.log(
+              "Not enough events recorded yet or recording not started/stopped."
+            );
+            alert(
+              "Please start and stop recording first, and interact with the page."
+            );
+            return;
+          }
+
+          // Clear previous replay if any
+          const replayContainer = document.getElementById("replay-container");
+          replayContainer.innerHTML = ""; // Clear the container
+
+          console.log(`Replaying ${events.length} events.`);
+
+          replayer = new rrweb.Replayer(events, {
+            root: replayContainer, // Specify the container element for replay
+            skipInactive: true,
           });
+
+          replayer.on("finish", () => {
+            console.log("Replay finished.");
+          });
+
+          try {
+            replayer.play();
+          } catch (error) {
+            console.error("Error during replay:", error);
+          }
+        });
       });
     </script>
   </body>
