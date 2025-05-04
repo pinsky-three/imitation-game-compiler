@@ -1,26 +1,10 @@
 [package]
 name = "imitator"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = [
-    "rustls-tls",
-], default-features = false }
-scraper = "0.19"
-url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
-lol_html = "1.1"
-urlencoding = "2.1"
-
-[profile.dev]
-# Disable optimizations in debug builds for faster compilation
-opt-level = 0
-
-[profile.release]
-# Enable optimizations in release builds
-opt-level = 3
-lto = true
-codegen-units = 1
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }

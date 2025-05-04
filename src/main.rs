@@ -1,356 +1,542 @@
-use axum::{
-    Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode, Uri, header},
-    response::{Html, IntoResponse, Response},
-    routing::get,
-};
-use lol_html::html_content::ContentType;
-use lol_html::{ElementContentHandlers, HtmlRewriter, Settings, element};
-use reqwest::Client;
-use serde::Deserialize;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::fs;
-use url::Url;
-use urlencoding;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::env;
+use std::error::Error;
+use std::fs;
+use std::path::Path;
+use std::process;
+use std::time::Instant;
 
-#[derive(Deserialize)]
-struct ProxyParams {
-    url: String,
+// --- Data Structures ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Event {
+    #[serde(rename = "type")]
+    event_type: i64,
+    data: Value, // Using Value for flexibility initially
+    timestamp: i64,
 }
 
-struct AppState {
-    http_client: Client,
+#[derive(Debug, Clone)]
+struct NodeInfo {
+    rrweb_id: i64,
+    tag_name: Option<String>,
+    attributes: HashMap<String, String>,
+    parent_id: Option<i64>,
+    text_content: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+enum ActionType {
+    Click,
+    Input,
+    // Add other types like Scroll, Navigate, etc. later
+}
+
+#[derive(Debug, Clone)]
+struct SimplifiedAction {
+    action_type: ActionType,
+    rrweb_id: i64,         // ID of the element interacted with
+    value: Option<String>, // For input actions
+    timestamp: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ActionWithSelector {
+    action_type: ActionType,
+    rrweb_id: i64,
+    value: Option<String>,
+    timestamp: i64,
+    selector: String, // CSS or XPath
+}
+
+// --- Main Function ---
 
 #[tokio::main]
-async fn main() {
-    let shared_state = Arc::new(AppState {
-        http_client: Client::builder()
-            .user_agent("rrweb-recorder-proxy/1.0") // Be polite with User-Agent
-            .build()
-            .expect("Failed to build reqwest client"),
-    });
-
-    let app = Router::new()
-        .route("/", get(serve_index))
-        .route("/proxy", get(proxy_handler))
-        .with_state(shared_state);
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Listening on http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
-
-async fn serve_index() -> impl IntoResponse {
-    match fs::read_to_string("index.html").await {
-        Ok(content) => Html(content).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to read index.html",
-        )
-            .into_response(),
+async fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <rrweb_json_path>", args[0]);
+        eprintln!("Example: {} recording.json", args[0]);
+        process::exit(1);
     }
-}
+    let rrweb_json_path = &args[1];
 
-async fn proxy_handler(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ProxyParams>,
-) -> impl IntoResponse {
-    // Thin wrapper that immediately delegates to a helper function
-    process_proxy_request(state, params).await
-}
+    println!(
+        "Starting conversion for '{}' targeting TypeScript Playwright...",
+        rrweb_json_path
+    );
 
-// Move all the complex processing to this helper function
-async fn process_proxy_request(state: Arc<AppState>, params: ProxyParams) -> Response {
-    // Validate and parse the target URL
-    let target_url = match Url::parse(&params.url) {
-        Ok(url) => {
-            if url.scheme() != "http" && url.scheme() != "https" {
-                return (StatusCode::BAD_REQUEST, "URL scheme must be http or https")
-                    .into_response();
-            }
-            url
-        }
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid URL").into_response(),
-    };
+    let start_time = Instant::now();
 
-    // Fetch the target page
-    let fetch_res = match state.http_client.get(target_url.clone()).send().await {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Failed to fetch {}: {}", target_url, e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Html(format!("Failed to fetch upstream URL: {}", e)),
+    let automation_script = convert_rrweb_to_script(rrweb_json_path).await?;
+
+    // --- Output to File ---
+    let output_dir = Path::new("./output");
+    fs::create_dir_all(output_dir)?;
+
+    // Generate output filename based on input filename
+    let input_path = Path::new(rrweb_json_path);
+    let input_filename_stem = input_path
+        .file_stem()
+        .ok_or_else(|| {
+            format!(
+                "Could not get file stem from input path: {}",
+                rrweb_json_path
             )
-                .into_response();
-        }
-    };
+        })?
+        .to_str()
+        .ok_or_else(|| "Input file stem contains invalid UTF-8")?;
 
-    // Check content type - only process HTML
-    let content_type = fetch_res
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
+    let output_filename = format!("{}.spec.ts", input_filename_stem);
+    let output_path = output_dir.join(&output_filename);
 
-    if !content_type.contains("text/html") {
-        // This path already builds and returns a Response directly.
-        let original_headers = fetch_res.headers().clone();
-        let status = fetch_res.status();
-        let body = fetch_res.bytes().await.unwrap_or_default();
-        let mut filtered_headers = HeaderMap::new();
-        for (key, value) in original_headers.iter() {
-            let lower_key = key.as_str().to_lowercase();
-            if lower_key != "x-frame-options"
-                && lower_key != "content-security-policy"
-                && lower_key != "content-encoding"
-                && lower_key != "transfer-encoding"
-            {
-                filtered_headers.insert(key.clone(), value.clone());
-            }
-        }
-        if let Some(ct) = original_headers.get(header::CONTENT_TYPE) {
-            filtered_headers.insert(header::CONTENT_TYPE, ct.clone());
-        }
-        filtered_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    println!(
+        "Step 5: Writing Playwright script to '{:?}'...",
+        output_path
+    );
+    fs::write(&output_path, &automation_script)?;
 
-        let mut response = Response::builder()
-            .status(status)
-            .body(axum::body::Body::from(body))
-            .unwrap_or_else(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to build response",
-                )
-                    .into_response()
-            }); // Keep .into_response() inside closure
-        *response.headers_mut() = filtered_headers;
-        println!("--- Sending non-HTML Response Headers ---");
-        for (key, value) in response.headers() {
-            println!(
-                "{}: {}",
-                key,
-                value.to_str().unwrap_or("[invalid header value]")
-            );
-        }
-        println!("---------------------------------------");
-        return response; // Return the built Response
-    }
+    let duration = start_time.elapsed();
+    println!("Conversion completed in {:?}", duration);
+    println!("Script saved to: {:?}", output_path);
 
-    // --- HTML Processing ---
-    // rewrite_html_response returns Response. Await and return it directly.
-    rewrite_html_response(fetch_res, target_url).await
+    Ok(())
 }
 
-// Helper function to rewrite URLs
-fn rewrite_url(url_str: &str, base_url: &Url) -> Result<String, url::ParseError> {
-    // Trim whitespace
-    let trimmed_url = url_str.trim();
+async fn convert_rrweb_to_script(rrweb_json_path: &str) -> Result<String, Box<dyn Error>> {
+    // Load the recording data
+    println!("Step 1: Loading rrweb events...");
+    let rrweb_events = load_json_from_file(rrweb_json_path)?;
+    println!("Loaded {} events.", rrweb_events.len());
 
-    // Ignore data URLs, javascript: URIs, and empty URLs
-    if trimmed_url.starts_with("data:")
-        || trimmed_url.starts_with("javascript:")
-        || trimmed_url.is_empty()
-    {
-        return Ok(trimmed_url.to_string());
-    }
+    // Extract initial metadata (like starting URL) - Placeholder
+    // let meta_event = find_event_by_type(&rrweb_events, 4); // Type 4 is Meta
+    let initial_url = "http://example.com"; // Placeholder URL
+    println!("Initial URL (placeholder): {}", initial_url);
 
-    // Try to parse the URL relative to the base URL
-    match base_url.join(trimmed_url) {
-        Ok(abs_url) => {
-            // If successful, rewrite it to go through the proxy
-            Ok(format!(
-                "/proxy?url={}",
-                urlencoding::encode(abs_url.as_str())
-            ))
+    // --- Stage 1: Pre-processing and Action Extraction ---
+    println!("Step 2: Pre-processing and extracting actions...");
+    let (dom_map, simplified_actions) = preprocess_rrweb_data(&rrweb_events)?;
+    println!("Extracted {} simplified actions.", simplified_actions.len());
+
+    // --- Stage 2: Selector Generation (LLM-Assisted) ---
+    println!("Step 3: Generating selectors...");
+    let actions_with_selectors = generate_selectors_for_actions(&simplified_actions, &dom_map)?;
+
+    // --- Stage 3: Code Generation ---
+    println!("Step 4: Generating TypeScript Playwright code...");
+    let automation_script = generate_automation_code(&actions_with_selectors, initial_url).await?;
+
+    Ok(automation_script)
+}
+
+// --- Utility/Placeholder Functions ---
+
+fn load_json_from_file(path: &str) -> Result<Vec<Event>, Box<dyn Error>> {
+    let start_load = Instant::now();
+    let content = fs::read_to_string(path)?;
+    let load_duration = start_load.elapsed();
+    println!("  Time to load file: {:?}", load_duration);
+
+    let start_parse = Instant::now();
+    let events: Vec<Event> = serde_json::from_str(&content)?;
+    let parse_duration = start_parse.elapsed();
+    println!("  Time to parse JSON: {:?}", parse_duration);
+
+    Ok(events)
+}
+
+// Find the first event of a specific type
+fn find_event_by_type(events: &[Event], event_type: i64) -> Option<&Event> {
+    events.iter().find(|e| e.event_type == event_type)
+}
+
+// Placeholder for recursive DOM snapshot parsing
+fn parse_dom_snapshot(
+    node_data: &Value,
+    dom_map: &mut HashMap<i64, NodeInfo>,
+    parent_id: Option<i64>,
+) {
+    // Needs to handle node structure, attributes, children, text content, etc.
+    if let Some(id) = node_data.get("id").and_then(|v| v.as_i64()) {
+        let mut attributes_map = HashMap::new();
+        if let Some(attrs) = node_data.get("attributes").and_then(|v| v.as_object()) {
+            for (key, value) in attrs {
+                if let Some(val_str) = value.as_str() {
+                    attributes_map.insert(key.clone(), val_str.to_string());
+                } else if value.is_number() || value.is_boolean() {
+                    // Convert numbers/bools to string representation
+                    attributes_map.insert(key.clone(), value.to_string());
+                }
+                // Ignore other value types for attributes for now
+            }
         }
-        Err(e) => {
-            // If parsing fails, return the original string (might be malformed)
-            // or handle the error differently if needed. Log the error.
-            eprintln!(
-                "Failed to parse/join URL '{}' relative to base '{}': {}",
-                trimmed_url, base_url, e
-            );
-            Err(e) // Propagate the error
-            // Alternatively, return original: Ok(trimmed_url.to_string())
+
+        let info = NodeInfo {
+            rrweb_id: id,
+            tag_name: node_data
+                .get("tagName")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            attributes: attributes_map, // Store parsed attributes
+            parent_id,
+            text_content: node_data
+                .get("textContent")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
+        dom_map.insert(id, info);
+
+        if let Some(children) = node_data.get("childNodes").and_then(|v| v.as_array()) {
+            for child_node in children {
+                parse_dom_snapshot(child_node, dom_map, Some(id));
+            }
         }
     }
 }
 
-// --- New function to handle HTML rewriting ---
-async fn rewrite_html_response(fetch_res: reqwest::Response, target_url: Url) -> Response {
-    // First, read the full HTML text from the response (this is the only await inside the function)
-    let html_content = match fetch_res.text().await {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("Failed to read text from {}: {}", target_url, e);
-            return (
-                StatusCode::BAD_GATEWAY,
-                Html(format!("Failed to read upstream response body: {}", e)),
-            )
-                .into_response();
+// Placeholder for applying incremental mutations to the dom_map
+// fn update_dom_map(dom_map: &mut HashMap<i64, NodeInfo>, mutation_data: &Value) {
+//     // TODO: Implement logic based on rrweb mutation data format
+//     // Needs to handle additions, removals, attribute changes, text changes
+//     // Example: Handle added nodes
+//     // if let Some(adds) = mutation_data.get("adds") {
+//     //     for addition in adds.as_array().unwrap_or(&vec![]) {
+//     //          let parent_id = addition.get("parentId").and_then(|v| v.as_i64());
+//     //          let node_data = addition.get("node");
+//     //          if let (Some(p_id), Some(n_data)) = (parent_id, node_data) {
+//     //               parse_dom_snapshot(n_data, dom_map, Some(p_id)); // Need to handle nextId correctly too
+//     //          }
+//     //     }
+//     // }
+//     // ... handle removals, attribute changes etc.
+// }
+
+// Placeholder: Flush buffered input actions
+fn flush_input_buffer(
+    current_input_buffer: &mut HashMap<i64, (String, i64)>, // Map rrweb_id -> (text, last_timestamp)
+    simplified_actions: &mut Vec<SimplifiedAction>,
+) {
+    for (rrweb_id, (text, last_timestamp)) in current_input_buffer.drain() {
+        let action = SimplifiedAction {
+            action_type: ActionType::Input,
+            rrweb_id,
+            value: Some(text),
+            timestamp: last_timestamp,
+        };
+        add_action(simplified_actions, action);
+    }
+}
+
+// Placeholder: Add action (potentially with simplification logic later)
+fn add_action(action_list: &mut Vec<SimplifiedAction>, new_action: SimplifiedAction) {
+    action_list.push(new_action);
+}
+
+// --- Stage 1 Helper Function ---
+fn preprocess_rrweb_data(
+    rrweb_events: &[Event],
+) -> Result<(HashMap<i64, NodeInfo>, Vec<SimplifiedAction>), Box<dyn Error>> {
+    let mut dom_map: HashMap<i64, NodeInfo> = HashMap::new();
+    let mut simplified_actions: Vec<SimplifiedAction> = Vec::new();
+    let mut current_input_buffer: HashMap<i64, (String, i64)> = HashMap::new(); // Maps rrweb_id -> (text, last_timestamp)
+
+    // Process initial snapshot to build the first dom_map
+    if let Some(initial_snapshot_event) = find_event_by_type(rrweb_events, 2) {
+        // Type 2 is Full Snapshot
+        println!("  Processing initial DOM snapshot...");
+        if let Some(node_data) = initial_snapshot_event.data.get("node") {
+            parse_dom_snapshot(node_data, &mut dom_map, None);
+            println!("  Initial dom_map contains {} nodes.", dom_map.len());
+        } else {
+            eprintln!("Warning: Full snapshot event found but missing 'node' data.");
         }
-    };
+    } else {
+        return Err("Error: No initial full snapshot (type 2) event found in recording.".into());
+    }
 
-    // After this point, there will be NO further `.await`, so non-Send types won't cross await boundaries
-
-    let mut rewritten_html_bytes = Vec::new();
-
-    // Inject rrweb script
-    let rrweb_script =
-        r#"<script src="https://cdn.jsdelivr.net/npm/rrweb@latest/dist/rrweb.min.js"></script>
-           <script>
-             window.addEventListener('load', () => {
-               if (typeof rrweb !== 'undefined') {
-                 console.log('rrweb loaded in iframe, starting recording...');
-                 rrweb.record({
-                   emit(event) {
-                     // Send event to parent window
-                     window.parent.postMessage({ type: 'rrwebEvent', event: event }, '*');
-                   },
-                   recordCanvas: false,
-                 });
-               } else {
-                 console.error('rrweb failed to load inside iframe.');
-               }
-               // --- Navigation Interception ---
-               document.addEventListener('click', (event) => {
-                 let target = event.target;
-                 while (target && target.tagName !== 'A') { target = target.parentElement; }
-                 if (target && target.href) {
-                   event.preventDefault();
-                   const targetUrl = new URL(target.href, window.location.href).href;
-                   console.log('Intercepted navigation to:', targetUrl);
-                   window.parent.postMessage({ type: 'navigateProxy', url: targetUrl }, '*');
-                 }
-               }, true);
-             });
-           </script>
-        "#
-        .to_string();
-
-    let base_href = target_url.origin().unicode_serialization();
-    let base_tag = format!("<base href=\"{}/\">\n", base_href);
-
-    let target_url_clone = target_url.clone();
-
-    let element_content_handlers = vec![
-        element!("head", |el| {
-            el.prepend(&base_tag, ContentType::Html);
-            el.append(&rrweb_script, ContentType::Html);
-            Ok(())
-        }),
-        element!("[href]", |el| {
-            if let Some(href) = el.get_attribute("href") {
-                if let Ok(rewritten) = rewrite_url(&href, &target_url_clone) {
-                    el.set_attribute("href", &rewritten)?;
-                }
-            }
-            Ok(())
-        }),
-        element!("[src]", |el| {
-            if let Some(src) = el.get_attribute("src") {
-                if let Ok(rewritten) = rewrite_url(&src, &target_url_clone) {
-                    el.set_attribute("src", &rewritten)?;
-                }
-            }
-            Ok(())
-        }),
-        element!("[srcset]", |el| {
-            if let Some(srcset) = el.get_attribute("srcset") {
-                // Full srcset handling
-                let rewritten_srcset = srcset
-                    .split(',')
-                    .map(|part| {
-                        let trimmed_part = part.trim();
-                        if let Some(url_end) = trimmed_part.find(' ') {
-                            let url_part = &trimmed_part[..url_end];
-                            let descriptor = &trimmed_part[url_end..];
-                            match rewrite_url(url_part, &target_url_clone) {
-                                Ok(rewritten_url) => format!("{} {}", rewritten_url, descriptor),
-                                Err(_) => trimmed_part.to_string(),
+    // Process incremental events
+    println!("  Processing incremental events...");
+    for event in rrweb_events.iter() {
+        if event.event_type == 3 {
+            // Incremental Snapshot
+            if let Some(source_type) = event.data.get("source").and_then(|v| v.as_i64()) {
+                match source_type {
+                    0 => { // Mutation
+                        // update_dom_map(&mut dom_map, &event.data); // TODO: Implement this
+                    }
+                    2 => {
+                        // Mouse Interaction
+                        if let Some(interaction_type) =
+                            event.data.get("type").and_then(|v| v.as_i64())
+                        {
+                            if interaction_type == 2 {
+                                // Click
+                                if let Some(target_id) =
+                                    event.data.get("id").and_then(|v| v.as_i64())
+                                {
+                                    flush_input_buffer(
+                                        &mut current_input_buffer,
+                                        &mut simplified_actions,
+                                    ); // Flush inputs before click
+                                    let action = SimplifiedAction {
+                                        action_type: ActionType::Click,
+                                        rrweb_id: target_id,
+                                        value: None,
+                                        timestamp: event.timestamp,
+                                    };
+                                    add_action(&mut simplified_actions, action);
+                                }
                             }
-                        } else {
-                            match rewrite_url(trimmed_part, &target_url_clone) {
-                                Ok(rewritten_url) => rewritten_url,
-                                Err(_) => trimmed_part.to_string(),
+                            // TODO: Handle other mouse interactions if needed (e.g., MouseUp)
+                        }
+                    }
+                    5 => {
+                        // Input
+                        if let (Some(target_id), Some(text)) = (
+                            event.data.get("id").and_then(|v| v.as_i64()),
+                            event.data.get("text").and_then(|v| v.as_str()),
+                        ) {
+                            // Buffer input: store last text value and timestamp for this element ID
+                            current_input_buffer
+                                .insert(target_id, (text.to_string(), event.timestamp));
+                        }
+                    }
+                    // TODO: Handle other source types (Scroll, etc.) if needed
+                    _ => {} // Ignore other incremental sources for now
+                }
+            }
+        }
+        // TODO: Handle Meta events (type 4) for URL changes mid-recording?
+    }
+
+    // Flush any remaining inputs at the end
+    flush_input_buffer(&mut current_input_buffer, &mut simplified_actions);
+
+    Ok((dom_map, simplified_actions))
+}
+
+// --- Stage 2 Helper Function ---
+fn generate_selectors_for_actions(
+    simplified_actions: &[SimplifiedAction],
+    dom_map: &HashMap<i64, NodeInfo>,
+) -> Result<Vec<ActionWithSelector>, Box<dyn Error>> {
+    let mut actions_with_selectors = Vec::new();
+
+    for action in simplified_actions {
+        let mut generated_selector = format!("TODO:selector_for_rrweb_id_{}", action.rrweb_id); // Default placeholder
+
+        if let Some(node_info) = dom_map.get(&action.rrweb_id) {
+            let mut selector_found = false;
+
+            // Helper function to create attribute selectors, escaping quotes
+            let create_attr_selector = |attr: &str, value: &str| -> String {
+                format!("*[{} = \"{}\"]", attr, value.replace('"', "\\\""))
+            };
+
+            // Strategy 1: Use ID if available and valid
+            if let Some(id_val) = node_info.attributes.get("id") {
+                if !id_val.is_empty() && !id_val.contains(char::is_whitespace) {
+                    generated_selector = format!("#{}", id_val);
+                    selector_found = true;
+                } else if !id_val.is_empty() {
+                    // Use attribute selector for invalid IDs
+                    generated_selector = create_attr_selector("id", id_val);
+                    selector_found = true;
+                }
+            }
+
+            // Strategy 2: Use data-testid if ID wasn't found/used
+            if !selector_found {
+                if let Some(test_id_val) = node_info.attributes.get("data-testid") {
+                    if !test_id_val.is_empty() {
+                        generated_selector = create_attr_selector("data-testid", test_id_val);
+                        selector_found = true;
+                    }
+                }
+            }
+
+            // Strategy 3: Use data-cy if still not found
+            if !selector_found {
+                if let Some(cy_id_val) = node_info.attributes.get("data-cy") {
+                    if !cy_id_val.is_empty() {
+                        generated_selector = create_attr_selector("data-cy", cy_id_val);
+                        selector_found = true;
+                    }
+                }
+            }
+
+            // Strategy 4: Use name attribute if still not found (often useful for form elements)
+            if !selector_found {
+                if let Some(name_val) = node_info.attributes.get("name") {
+                    if !name_val.is_empty() {
+                        // Optionally, be more specific for form elements
+                        // if let Some(tag) = &node_info.tag_name {
+                        //    if ["input", "button", "select", "textarea"].contains(&tag.to_lowercase().as_str()) {
+                        //        generated_selector = format!("{}[name=\"{}\"]", tag, name_val.replace('"', "\\\""));
+                        //        selector_found = true;
+                        //    }
+                        // }
+                        // For simplicity, use the general attribute selector for now
+                        if !selector_found {
+                            // Check again in case the more specific one above was used
+                            generated_selector = create_attr_selector("name", name_val);
+                            selector_found = true;
+                        }
+                    }
+                }
+            }
+
+            // Strategy 5: Use the first class name if still not found
+            if !selector_found {
+                if let Some(class_val) = node_info.attributes.get("class") {
+                    if !class_val.trim().is_empty() {
+                        // Split by whitespace and take the first non-empty class
+                        if let Some(first_class) = class_val.split_whitespace().next() {
+                            if !first_class.is_empty() {
+                                // Generate selector like tagname.classname
+                                // Escape the class name if it contains special CSS characters (simplistic check)
+                                let mut escaped_class = first_class.to_string();
+                                // Basic escaping - might need refinement for full CSS spec
+                                escaped_class =
+                                    escaped_class.replace(':', "\\:").replace('.', "\\.");
+
+                                if let Some(tag) = &node_info.tag_name {
+                                    generated_selector = format!("{}.{}", tag, escaped_class);
+                                    selector_found = true;
+                                } else {
+                                    // Fallback to attribute selector if tag name is missing
+                                    generated_selector = format!("*.{}", escaped_class);
+                                    selector_found = true;
+                                }
                             }
                         }
-                    })
-                    .collect::<Vec<String>>()
-                    .join(", ");
-                el.set_attribute("srcset", &rewritten_srcset)?;
+                    }
+                }
             }
-            Ok(())
-        }),
-        // TODO: Add more handlers
-    ];
 
-    let mut rewriter = HtmlRewriter::new(
-        Settings {
-            element_content_handlers,
-            ..Settings::default()
-        },
-        |c: &[u8]| rewritten_html_bytes.extend_from_slice(c),
-    );
+            // Fallback Strategy: If no preferred selector found, use tag + rrweb_id
+            if !selector_found {
+                if let Some(tag) = &node_info.tag_name {
+                    generated_selector = format!("{}[rrweb_id=\"{}\"]", tag, action.rrweb_id);
+                } else {
+                    generated_selector = format!("*[rrweb_id=\"{}\"]", action.rrweb_id);
+                    // If even tag is missing
+                }
+            }
+        } // If node_info is None, keep the default placeholder
 
-    // Run the rewriter synchronously (no await)
-    if let Err(e) = rewriter.write(html_content.as_bytes()) {
-        eprintln!("HTML rewriting error: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to rewrite HTML").into_response();
-    }
-    if let Err(e) = rewriter.end() {
-        eprintln!("HTML rewriting end error: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to finalize HTML rewriting",
-        )
-            .into_response();
+        actions_with_selectors.push(ActionWithSelector {
+            action_type: action.action_type.clone(),
+            rrweb_id: action.rrweb_id,
+            value: action.value.clone(),
+            timestamp: action.timestamp,
+            selector: generated_selector, // Use the generated or placeholder selector
+        });
     }
 
-    // Build headers and final Response (same as before)
-    let mut final_headers = HeaderMap::new();
-    final_headers.insert(
-        header::CONTENT_TYPE,
-        "text/html; charset=utf-8".parse().unwrap(),
-    );
-    final_headers.insert(
-        header::CACHE_CONTROL,
-        "no-store, no-cache, must-revalidate, proxy-revalidate"
-            .parse()
-            .unwrap(),
-    );
-    final_headers.insert(header::PRAGMA, "no-cache".parse().unwrap());
-    final_headers.insert(header::EXPIRES, "0".parse().unwrap());
-    final_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
-
-    let final_html = String::from_utf8(rewritten_html_bytes).unwrap_or_else(|e| {
-        eprintln!("Rewritten HTML is not valid UTF-8: {}", e);
-        "Error: Rewritten content is not valid UTF-8".to_string()
-    });
-    let mut response = (final_headers, Html(final_html)).into_response();
-
-    response.headers_mut().remove(header::X_FRAME_OPTIONS);
-    response
-        .headers_mut()
-        .remove(header::CONTENT_SECURITY_POLICY);
-
-    println!("--- Sending HTML Response Headers ---");
-    for (key, value) in response.headers() {
-        println!(
-            "{}: {}",
-            key,
-            value.to_str().unwrap_or("[invalid header value]")
-        );
-    }
-    println!("-----------------------------------");
-
-    response
+    Ok(actions_with_selectors)
 }
-// --- End of new function ---
+
+// --- Stage 3 Helper Function (Placeholder) ---
+async fn generate_automation_code(
+    actions_with_selectors: &[ActionWithSelector],
+    initial_url: &str,
+) -> Result<String, Box<dyn Error>> {
+    // Use standard TypeScript Playwright structure
+    let mut generated_code = String::new();
+
+    // Add imports
+    generated_code.push_str("import { test, expect } from '@playwright/test';\n\n");
+
+    // Add test block
+    generated_code.push_str("test('Generated from rrweb recording', async ({ page }) => {\n");
+
+    // Add initial navigation
+    // Escape backticks and quotes in URL for TS template literals/strings
+    let escaped_initial_url = initial_url.replace('`', "\\`").replace('"', "\\\"");
+    generated_code.push_str(&format!(
+        "  await page.goto(\"{}\");\n\n",
+        escaped_initial_url
+    ));
+
+    // Loop through actions and generate code
+    for action in actions_with_selectors {
+        // Add timestamp comment
+        generated_code.push_str(&format!("  // Timestamp: {}\n", action.timestamp));
+
+        // Add comment describing the action
+        generated_code.push_str(&format!(
+            "  // Action: {:?}, Selector: '{}'",
+            action.action_type, action.selector
+        ));
+        if let Some(val) = &action.value {
+            generated_code.push_str(&format!(", Value: '{}'", val));
+        }
+        generated_code.push_str("\n"); // Use push_str for consistency
+
+        // Add actual code generation based on type
+        match action.action_type {
+            ActionType::Click => {
+                let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
+                generated_code.push_str(&format!(
+                    "  await page.locator(\"{}\").click();",
+                    escaped_selector
+                ));
+                generated_code.push_str("\n");
+            }
+            ActionType::Input => {
+                if let Some(val) = &action.value {
+                    let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
+                    let escaped_value = val
+                        .replace('\\', "\\\\")
+                        .replace('`', "\\`")
+                        .replace('"', "\\\"");
+
+                    let is_obscured = val.len() > 20
+                        && val
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '=' || c == '+' || c == '/');
+
+                    if is_obscured {
+                        generated_code.push_str(
+                            "  // Input value seems obscured/masked, using placeholder:\n",
+                        );
+                        generated_code.push_str(&format!(
+                            "  await page.locator(\"{}\").fill(\"TODO: Add realistic test data\");",
+                            escaped_selector
+                        ));
+                    } else {
+                        generated_code.push_str(&format!(
+                            "  await page.locator(\"{}\").fill(\"{}\");",
+                            escaped_selector, escaped_value
+                        ));
+                    }
+                    generated_code.push_str("\n");
+                }
+            }
+        }
+        generated_code.push_str("\n"); // Add blank line between actions
+    }
+
+    // Add placeholder for assertions or final actions
+    generated_code.push_str(
+        "  // Example assertion (optional):
+",
+    );
+    generated_code
+        .push_str("  // await expect(page.locator(\'body\')).toContainText(\'Success!\');\n\n");
+
+    // Close test block
+    generated_code.push_str("});\n");
+
+    Ok(generated_code)
+}
+
+// --- Other Utility Placeholders ---
+// fn get_node_info(map: &HashMap<i64, NodeInfo>, id: i64) -> Option<&NodeInfo> { map.get(&id) }
+// fn format_node_context_for_llm(node: &NodeInfo, parent: Option<&NodeInfo>) -> String { /* ... */ String::new() }
+// async fn call_llm_selector_api(prompt: &str) -> Result<String, Box<dyn Error>> { Ok("llm_generated_selector".to_string()) }
+// async fn call_llm_code_generation_api(prompt: &str) -> Result<String, Box<dyn Error>> { Ok("llm_generated_code".to_string()) }
