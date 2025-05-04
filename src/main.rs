@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::path::Path;
 use std::process;
 use std::time::Instant;
 
@@ -55,44 +56,56 @@ struct ActionWithSelector {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!(
-            "Usage: {} <rrweb_json_path> <target_language_framework>",
-            args[0]
-        );
-        eprintln!("Example: {} recording.json python-playwright", args[0]);
+    if args.len() != 2 {
+        eprintln!("Usage: {} <rrweb_json_path>", args[0]);
+        eprintln!("Example: {} recording.json", args[0]);
         process::exit(1);
     }
     let rrweb_json_path = &args[1];
-    let target_language_framework = &args[2]; // e.g., "python-playwright", "js-puppeteer"
 
     println!(
-        "Starting conversion for '{}' targeting '{}'...",
-        rrweb_json_path, target_language_framework
+        "Starting conversion for '{}' targeting TypeScript Playwright...",
+        rrweb_json_path
     );
 
     let start_time = Instant::now();
 
-    let automation_script =
-        convert_rrweb_to_script(rrweb_json_path, target_language_framework).await?;
+    let automation_script = convert_rrweb_to_script(rrweb_json_path).await?;
+
+    // --- Output to File ---
+    let output_dir = Path::new("./output");
+    fs::create_dir_all(output_dir)?;
+
+    // Generate output filename based on input filename
+    let input_path = Path::new(rrweb_json_path);
+    let input_filename_stem = input_path
+        .file_stem()
+        .ok_or_else(|| {
+            format!(
+                "Could not get file stem from input path: {}",
+                rrweb_json_path
+            )
+        })?
+        .to_str()
+        .ok_or_else(|| "Input file stem contains invalid UTF-8")?;
+
+    let output_filename = format!("{}.spec.ts", input_filename_stem);
+    let output_path = output_dir.join(&output_filename);
 
     println!(
-        "
---- Generated Automation Script ---"
+        "Step 5: Writing Playwright script to '{:?}'...",
+        output_path
     );
-    println!("{}", automation_script);
-    println!("---------------------------------");
+    fs::write(&output_path, &automation_script)?;
 
     let duration = start_time.elapsed();
     println!("Conversion completed in {:?}", duration);
+    println!("Script saved to: {:?}", output_path);
 
     Ok(())
 }
 
-async fn convert_rrweb_to_script(
-    rrweb_json_path: &str,
-    target_language_framework: &str,
-) -> Result<String, Box<dyn Error>> {
+async fn convert_rrweb_to_script(rrweb_json_path: &str) -> Result<String, Box<dyn Error>> {
     // Load the recording data
     println!("Step 1: Loading rrweb events...");
     let rrweb_events = load_json_from_file(rrweb_json_path)?;
@@ -113,13 +126,8 @@ async fn convert_rrweb_to_script(
     let actions_with_selectors = generate_selectors_for_actions(&simplified_actions, &dom_map)?;
 
     // --- Stage 3: Code Generation ---
-    println!("Step 4: Generating automation code (placeholder)...");
-    let automation_script = generate_automation_code(
-        &actions_with_selectors,
-        target_language_framework,
-        initial_url,
-    )
-    .await?;
+    println!("Step 4: Generating TypeScript Playwright code...");
+    let automation_script = generate_automation_code(&actions_with_selectors, initial_url).await?;
 
     Ok(automation_script)
 }
@@ -190,21 +198,21 @@ fn parse_dom_snapshot(
 }
 
 // Placeholder for applying incremental mutations to the dom_map
-fn update_dom_map(dom_map: &mut HashMap<i64, NodeInfo>, mutation_data: &Value) {
-    // TODO: Implement logic based on rrweb mutation data format
-    // Needs to handle additions, removals, attribute changes, text changes
-    // Example: Handle added nodes
-    // if let Some(adds) = mutation_data.get("adds") {
-    //     for addition in adds.as_array().unwrap_or(&vec![]) {
-    //          let parent_id = addition.get("parentId").and_then(|v| v.as_i64());
-    //          let node_data = addition.get("node");
-    //          if let (Some(p_id), Some(n_data)) = (parent_id, node_data) {
-    //               parse_dom_snapshot(n_data, dom_map, Some(p_id)); // Need to handle nextId correctly too
-    //          }
-    //     }
-    // }
-    // ... handle removals, attribute changes etc.
-}
+// fn update_dom_map(dom_map: &mut HashMap<i64, NodeInfo>, mutation_data: &Value) {
+//     // TODO: Implement logic based on rrweb mutation data format
+//     // Needs to handle additions, removals, attribute changes, text changes
+//     // Example: Handle added nodes
+//     // if let Some(adds) = mutation_data.get("adds") {
+//     //     for addition in adds.as_array().unwrap_or(&vec![]) {
+//     //          let parent_id = addition.get("parentId").and_then(|v| v.as_i64());
+//     //          let node_data = addition.get("node");
+//     //          if let (Some(p_id), Some(n_data)) = (parent_id, node_data) {
+//     //               parse_dom_snapshot(n_data, dom_map, Some(p_id)); // Need to handle nextId correctly too
+//     //          }
+//     //     }
+//     // }
+//     // ... handle removals, attribute changes etc.
+// }
 
 // Placeholder: Flush buffered input actions
 fn flush_input_buffer(
@@ -435,105 +443,94 @@ fn generate_selectors_for_actions(
 // --- Stage 3 Helper Function (Placeholder) ---
 async fn generate_automation_code(
     actions_with_selectors: &[ActionWithSelector],
-    target_language_framework: &str,
     initial_url: &str,
 ) -> Result<String, Box<dyn Error>> {
-    // TODO: Implement LLM call or template-based code generation
-    // For now, just return a summary string
+    // Use standard TypeScript Playwright structure
+    let mut generated_code = String::new();
 
-    let mut generated_code = format!(
-        "# Automation script generated for target: {}
-# Starting URL: {}
+    // Add imports
+    generated_code.push_str("import { test, expect } from '@playwright/test';\n\n");
 
-",
-        target_language_framework, initial_url
-    );
+    // Add test block
+    generated_code.push_str("test('Generated from rrweb recording', async ({ page }) => {\n");
 
-    // Add boilerplate start (example for python-playwright)
-    if target_language_framework == "python-playwright" {
-        generated_code.push_str(
-            "from playwright.sync_api import sync_playwright
+    // Add initial navigation
+    // Escape backticks and quotes in URL for TS template literals/strings
+    let escaped_initial_url = initial_url.replace('`', "\\`").replace('"', "\\\"");
+    generated_code.push_str(&format!(
+        "  await page.goto(\"{}\");\n\n",
+        escaped_initial_url
+    ));
 
-",
-        );
-        generated_code.push_str(
-            "with sync_playwright() as p:
-",
-        );
-        generated_code.push_str(
-            "    browser = p.chromium.launch()
-",
-        );
-        generated_code.push_str(
-            "    page = browser.new_page()
-",
-        );
-        generated_code.push_str(&format!("    page.goto(\"{}\")", initial_url));
-    } else {
-        generated_code.push_str(&format!(
-            "# Code generation for '{}' not fully implemented.
-
-",
-            target_language_framework
-        ));
-    }
-
+    // Loop through actions and generate code
     for action in actions_with_selectors {
+        // Add timestamp comment
+        generated_code.push_str(&format!("  // Timestamp: {}\n", action.timestamp));
+
+        // Add comment describing the action
         generated_code.push_str(&format!(
-            "    # Action: {:?}, Selector: '{}'",
+            "  // Action: {:?}, Selector: '{}'",
             action.action_type, action.selector
         ));
         if let Some(val) = &action.value {
             generated_code.push_str(&format!(", Value: '{}'", val));
         }
-        generated_code.push('\n');
+        generated_code.push_str("\n"); // Use push_str for consistency
 
-        // Add actual code generation based on type and target (example for python-playwright)
-        if target_language_framework == "python-playwright" {
-            match action.action_type {
-                ActionType::Click => {
-                    let escaped_selector = action.selector.replace('"', "\\\""); // Escape only double quotes for Python
-                                                                                 // Use format! directly with escaped selector
-                    generated_code.push_str(&format!(
-                        r#"    page.locator("{}").click()"#,
-                        escaped_selector
-                    ));
-                    generated_code.push('\n');
-                }
-                ActionType::Input => {
-                    if let Some(val) = &action.value {
-                        let escaped_selector = action.selector.replace('"', "\\\"");
-                        // Escape backslashes first, then double quotes for the value string literal in Python
-                        let escaped_value = val.replace('\\', "\\\\").replace('"', "\\\"");
-                        // Use format! directly with escaped selector and value
+        // Add actual code generation based on type
+        match action.action_type {
+            ActionType::Click => {
+                let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
+                generated_code.push_str(&format!(
+                    "  await page.locator(\"{}\").click();",
+                    escaped_selector
+                ));
+                generated_code.push_str("\n");
+            }
+            ActionType::Input => {
+                if let Some(val) = &action.value {
+                    let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
+                    let escaped_value = val
+                        .replace('\\', "\\\\")
+                        .replace('`', "\\`")
+                        .replace('"', "\\\"");
+
+                    let is_obscured = val.len() > 20
+                        && val
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '=' || c == '+' || c == '/');
+
+                    if is_obscured {
+                        generated_code.push_str(
+                            "  // Input value seems obscured/masked, using placeholder:\n",
+                        );
                         generated_code.push_str(&format!(
-                            r#"    page.locator("{}").fill("{}")"#,
+                            "  await page.locator(\"{}\").fill(\"TODO: Add realistic test data\");",
+                            escaped_selector
+                        ));
+                    } else {
+                        generated_code.push_str(&format!(
+                            "  await page.locator(\"{}\").fill(\"{}\");",
                             escaped_selector, escaped_value
                         ));
-                        generated_code.push('\n');
                     }
+                    generated_code.push_str("\n");
                 }
             }
-            generated_code.push('\n'); // Add blank line between actions
         }
+        generated_code.push_str("\n"); // Add blank line between actions
     }
 
-    // Add boilerplate end (example for python-playwright)
-    if target_language_framework == "python-playwright" {
-        generated_code.push_str(
-            "
-    # Example: Add a pause or screenshot
+    // Add placeholder for assertions or final actions
+    generated_code.push_str(
+        "  // Example assertion (optional):
 ",
-        );
-        generated_code.push_str(
-            "    # page.pause()
-",
-        );
-        generated_code.push_str(
-            "    browser.close()
-",
-        );
-    }
+    );
+    generated_code
+        .push_str("  // await expect(page.locator(\'body\')).toContainText(\'Success!\');\n\n");
+
+    // Close test block
+    generated_code.push_str("});\n");
 
     Ok(generated_code)
 }
