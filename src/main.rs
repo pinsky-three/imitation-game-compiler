@@ -19,12 +19,11 @@ struct Event {
 
 #[derive(Debug, Clone)]
 struct NodeInfo {
-    // Simplified for now, based on pseudocode
+    rrweb_id: i64,
     tag_name: Option<String>,
-    attributes: Option<HashMap<String, String>>,
+    attributes: HashMap<String, String>,
     parent_id: Option<i64>,
     text_content: Option<String>,
-    rrweb_id: i64, // Add rrweb_id here for easier reference
 }
 
 #[derive(Debug, Clone)]
@@ -110,9 +109,8 @@ async fn convert_rrweb_to_script(
     println!("Extracted {} simplified actions.", simplified_actions.len());
 
     // --- Stage 2: Selector Generation (LLM-Assisted) ---
-    println!("Step 3: Generating selectors (placeholder)...");
-    let actions_with_selectors =
-        generate_selectors_for_actions(&simplified_actions, &dom_map).await?;
+    println!("Step 3: Generating selectors...");
+    let actions_with_selectors = generate_selectors_for_actions(&simplified_actions, &dom_map)?;
 
     // --- Stage 3: Code Generation ---
     println!("Step 4: Generating automation code (placeholder)...");
@@ -153,17 +151,28 @@ fn parse_dom_snapshot(
     dom_map: &mut HashMap<i64, NodeInfo>,
     parent_id: Option<i64>,
 ) {
-    // TODO: Implement recursive parsing based on rrweb snapshot format
     // Needs to handle node structure, attributes, children, text content, etc.
     if let Some(id) = node_data.get("id").and_then(|v| v.as_i64()) {
+        let mut attributes_map = HashMap::new();
+        if let Some(attrs) = node_data.get("attributes").and_then(|v| v.as_object()) {
+            for (key, value) in attrs {
+                if let Some(val_str) = value.as_str() {
+                    attributes_map.insert(key.clone(), val_str.to_string());
+                } else if value.is_number() || value.is_boolean() {
+                    // Convert numbers/bools to string representation
+                    attributes_map.insert(key.clone(), value.to_string());
+                }
+                // Ignore other value types for attributes for now
+            }
+        }
+
         let info = NodeInfo {
             rrweb_id: id,
             tag_name: node_data
                 .get("tagName")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            // attributes: node_data.get("attributes")... parse into HashMap ...
-            attributes: None, // Placeholder
+            attributes: attributes_map, // Store parsed attributes
             parent_id,
             text_content: node_data
                 .get("textContent")
@@ -301,29 +310,122 @@ fn preprocess_rrweb_data(
     Ok((dom_map, simplified_actions))
 }
 
-// --- Stage 2 Helper Function (Placeholder) ---
-async fn generate_selectors_for_actions(
+// --- Stage 2 Helper Function ---
+fn generate_selectors_for_actions(
     simplified_actions: &[SimplifiedAction],
     dom_map: &HashMap<i64, NodeInfo>,
 ) -> Result<Vec<ActionWithSelector>, Box<dyn Error>> {
     let mut actions_with_selectors = Vec::new();
 
     for action in simplified_actions {
-        // TODO: Implement LLM call or other selector generation logic
-        // 1. Get node_info from dom_map using action.rrweb_id
-        // 2. Get parent_info if available
-        // 3. Format context for LLM
-        // 4. Call LLM API (placeholder)
-        // 5. Create ActionWithSelector
+        let mut generated_selector = format!("TODO:selector_for_rrweb_id_{}", action.rrweb_id); // Default placeholder
 
-        let placeholder_selector = format!("placeholder_selector_for_id_{}", action.rrweb_id); // Simple placeholder
+        if let Some(node_info) = dom_map.get(&action.rrweb_id) {
+            let mut selector_found = false;
+
+            // Helper function to create attribute selectors, escaping quotes
+            let create_attr_selector = |attr: &str, value: &str| -> String {
+                format!("*[{} = \"{}\"]", attr, value.replace('"', "\\\""))
+            };
+
+            // Strategy 1: Use ID if available and valid
+            if let Some(id_val) = node_info.attributes.get("id") {
+                if !id_val.is_empty() && !id_val.contains(char::is_whitespace) {
+                    generated_selector = format!("#{}", id_val);
+                    selector_found = true;
+                } else if !id_val.is_empty() {
+                    // Use attribute selector for invalid IDs
+                    generated_selector = create_attr_selector("id", id_val);
+                    selector_found = true;
+                }
+            }
+
+            // Strategy 2: Use data-testid if ID wasn't found/used
+            if !selector_found {
+                if let Some(test_id_val) = node_info.attributes.get("data-testid") {
+                    if !test_id_val.is_empty() {
+                        generated_selector = create_attr_selector("data-testid", test_id_val);
+                        selector_found = true;
+                    }
+                }
+            }
+
+            // Strategy 3: Use data-cy if still not found
+            if !selector_found {
+                if let Some(cy_id_val) = node_info.attributes.get("data-cy") {
+                    if !cy_id_val.is_empty() {
+                        generated_selector = create_attr_selector("data-cy", cy_id_val);
+                        selector_found = true;
+                    }
+                }
+            }
+
+            // Strategy 4: Use name attribute if still not found (often useful for form elements)
+            if !selector_found {
+                if let Some(name_val) = node_info.attributes.get("name") {
+                    if !name_val.is_empty() {
+                        // Optionally, be more specific for form elements
+                        // if let Some(tag) = &node_info.tag_name {
+                        //    if ["input", "button", "select", "textarea"].contains(&tag.to_lowercase().as_str()) {
+                        //        generated_selector = format!("{}[name=\"{}\"]", tag, name_val.replace('"', "\\\""));
+                        //        selector_found = true;
+                        //    }
+                        // }
+                        // For simplicity, use the general attribute selector for now
+                        if !selector_found {
+                            // Check again in case the more specific one above was used
+                            generated_selector = create_attr_selector("name", name_val);
+                            selector_found = true;
+                        }
+                    }
+                }
+            }
+
+            // Strategy 5: Use the first class name if still not found
+            if !selector_found {
+                if let Some(class_val) = node_info.attributes.get("class") {
+                    if !class_val.trim().is_empty() {
+                        // Split by whitespace and take the first non-empty class
+                        if let Some(first_class) = class_val.split_whitespace().next() {
+                            if !first_class.is_empty() {
+                                // Generate selector like tagname.classname
+                                // Escape the class name if it contains special CSS characters (simplistic check)
+                                let mut escaped_class = first_class.to_string();
+                                // Basic escaping - might need refinement for full CSS spec
+                                escaped_class =
+                                    escaped_class.replace(':', "\\:").replace('.', "\\.");
+
+                                if let Some(tag) = &node_info.tag_name {
+                                    generated_selector = format!("{}.{}", tag, escaped_class);
+                                    selector_found = true;
+                                } else {
+                                    // Fallback to attribute selector if tag name is missing
+                                    generated_selector = format!("*.{}", escaped_class);
+                                    selector_found = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback Strategy: If no preferred selector found, use tag + rrweb_id
+            if !selector_found {
+                if let Some(tag) = &node_info.tag_name {
+                    generated_selector = format!("{}[rrweb_id=\"{}\"]", tag, action.rrweb_id);
+                } else {
+                    generated_selector = format!("*[rrweb_id=\"{}\"]", action.rrweb_id);
+                    // If even tag is missing
+                }
+            }
+        } // If node_info is None, keep the default placeholder
 
         actions_with_selectors.push(ActionWithSelector {
             action_type: action.action_type.clone(),
             rrweb_id: action.rrweb_id,
             value: action.value.clone(),
             timestamp: action.timestamp,
-            selector: placeholder_selector, // Placeholder
+            selector: generated_selector, // Use the generated or placeholder selector
         });
     }
 
