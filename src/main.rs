@@ -5,9 +5,14 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process;
 use std::time::Instant;
+
+// --- Type Aliases ---
+type DomMap = HashMap<i64, NodeInfo>;
+type SimplifiedActionList = Vec<SimplifiedAction>;
+type PreprocessingResultData = (DomMap, SimplifiedActionList);
 
 // --- Data Structures ---
 
@@ -21,11 +26,11 @@ struct Event {
 
 #[derive(Debug, Clone)]
 struct NodeInfo {
-    rrweb_id: i64,
+    _rrweb_id: i64,
     tag_name: Option<String>,
     attributes: HashMap<String, String>,
-    parent_id: Option<i64>,
-    text_content: Option<String>,
+    _parent_id: Option<i64>,
+    _text_content: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +51,7 @@ struct SimplifiedAction {
 #[derive(Debug, Clone)]
 struct ActionWithSelector {
     action_type: ActionType,
-    rrweb_id: i64,
+    _rrweb_id: i64,
     value: Option<String>,
     timestamp: i64,
     selector: String, // CSS or XPath
@@ -286,14 +291,14 @@ fn parse_dom_snapshot(
         }
 
         let info = NodeInfo {
-            rrweb_id: id,
+            _rrweb_id: id,
             tag_name: node_data
                 .get("tagName")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             attributes: attributes_map, // Store parsed attributes
-            parent_id,
-            text_content: node_data
+            _parent_id: parent_id,
+            _text_content: node_data
                 .get("textContent")
                 .and_then(|v| v.as_str())
                 .map(String::from),
@@ -349,10 +354,10 @@ fn add_action(action_list: &mut Vec<SimplifiedAction>, new_action: SimplifiedAct
 // --- Stage 1 Helper Function ---
 fn preprocess_rrweb_data(
     rrweb_events: &[Event],
-) -> Result<(HashMap<i64, NodeInfo>, Vec<SimplifiedAction>), Box<dyn Error>> {
-    let mut dom_map: HashMap<i64, NodeInfo> = HashMap::new();
-    let mut simplified_actions: Vec<SimplifiedAction> = Vec::new();
-    let mut current_input_buffer: HashMap<i64, (String, i64)> = HashMap::new(); // Maps rrweb_id -> (text, last_timestamp)
+) -> Result<PreprocessingResultData, Box<dyn Error>> {
+    let mut dom_map: DomMap = HashMap::new();
+    let mut simplified_actions: SimplifiedActionList = Vec::new();
+    let mut current_input_buffer: HashMap<i64, (String, i64)> = HashMap::new();
 
     // Process initial snapshot to build the first dom_map
     if let Some(initial_snapshot_event) = find_event_by_type(rrweb_events, 2) {
@@ -541,7 +546,7 @@ fn generate_selectors_for_actions(
 
         actions_with_selectors.push(ActionWithSelector {
             action_type: action.action_type.clone(),
-            rrweb_id: action.rrweb_id,
+            _rrweb_id: action.rrweb_id,
             value: action.value.clone(),
             timestamp: action.timestamp,
             selector: generated_selector, // Use the generated or placeholder selector
@@ -577,7 +582,7 @@ async fn generate_action_sequence_code(
         if let Some(val) = &action.value {
             action_sequence_code.push_str(&format!(", Value: '{}'", val));
         }
-        action_sequence_code.push_str("\n");
+        action_sequence_code.push('\n');
 
         // Add actual code generation (indented)
         match action.action_type {
@@ -587,7 +592,7 @@ async fn generate_action_sequence_code(
                     "  await page.locator(\"{}\").click();",
                     escaped_selector
                 ));
-                action_sequence_code.push_str("\n");
+                action_sequence_code.push('\n');
             }
             ActionType::Input => {
                 if let Some(val) = &action.value {
@@ -616,11 +621,11 @@ async fn generate_action_sequence_code(
                             escaped_selector, escaped_value
                         ));
                     }
-                    action_sequence_code.push_str("\n");
+                    action_sequence_code.push('\n');
                 }
             }
         }
-        action_sequence_code.push_str("\n"); // Add blank line between actions
+        action_sequence_code.push('\n'); // Add blank line between actions
     }
 
     Ok(action_sequence_code.trim_end().to_string()) // Trim trailing whitespace/newlines
