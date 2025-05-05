@@ -1,10 +1,11 @@
+use fs_extra::dir::{copy, CopyOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
@@ -64,19 +65,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let rrweb_json_path = &args[1];
 
     println!(
-        "Starting conversion for '{}' targeting TypeScript Playwright...",
+        "Starting conversion for '{}' to Stagehand project...",
         rrweb_json_path
     );
 
     let start_time = Instant::now();
 
-    let automation_script = convert_rrweb_to_script(rrweb_json_path).await?;
+    // Extract initial URL and generate action sequence string
+    let (initial_url, action_sequence) = convert_rrweb_to_script(rrweb_json_path).await?;
 
-    // --- Output to File ---
-    let output_dir = Path::new("./output");
-    fs::create_dir_all(output_dir)?;
+    // --- Determine Paths ---
 
-    // Generate output filename based on input filename
+    // Find the executable's path to locate the template directory reliably
+    let exe_path = env::current_exe()?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or("Could not get executable's parent directory")?;
+    // Adjust based on where the executable is relative to the project root
+    // Assuming executable is in target/release/ or target/debug/, go up 3 levels.
+    // If run via `cargo run`, cwd might be project root, adjust accordingly.
+    // Let's try finding project root by looking for Cargo.toml
+    let mut project_root = exe_dir.to_path_buf();
+    loop {
+        if project_root.join("Cargo.toml").is_file() {
+            break;
+        }
+        if !project_root.pop() {
+            return Err("Could not find project root (Cargo.toml) from executable path".into());
+        }
+    }
+
+    let template_dir = project_root.join("templates/initial_state");
+    if !template_dir.is_dir() {
+        return Err(format!("Template directory not found at {:?}", template_dir).into());
+    }
+
+    let output_base_dir = Path::new("./output"); // Output relative to CWD
+
     let input_path = Path::new(rrweb_json_path);
     let input_filename_stem = input_path
         .file_stem()
@@ -87,34 +112,120 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
         })?
         .to_str()
-        .ok_or_else(|| "Input file stem contains invalid UTF-8")?;
+        .unwrap(); // Using unwrap based on user change
 
-    let output_filename = format!("{}.spec.ts", input_filename_stem);
-    let output_path = output_dir.join(&output_filename);
+    // Output project directory (e.g., ./output/rrweb-recording-xyz/)
+    let output_project_dir = output_base_dir.join(input_filename_stem);
 
     println!(
-        "Step 5: Writing Playwright script to '{:?}'...",
-        output_path
+        "Step 5: Preparing output project directory '{:?}'...",
+        output_project_dir
     );
-    fs::write(&output_path, &automation_script)?;
+    fs::create_dir_all(&output_project_dir)?;
+
+    // --- Copy Template Files ---
+    println!(
+        "Step 6: Copying Stagehand template files from {:?}...",
+        template_dir
+    );
+    let mut copy_options = CopyOptions::new();
+    copy_options.overwrite = true;
+    copy_options.content_only = true; // Copy contents, not the 'initial_state' folder itself
+
+    // Remove unused skip_items variable
+    // let skip_items = vec![ ... ];
+
+    // --- TEMPORARY REPLACEMENT FOR fs_extra::copy with filtering ---
+    // Manual selective copy (more robust for skipping)
+    let entries = fs::read_dir(&template_dir) // Use reference to template_dir PathBuf
+        .map_err(|e| {
+            format!(
+                "Failed to read template directory {:?}: {}",
+                template_dir, e
+            )
+        })?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+
+        // Skip unwanted items
+        if file_name == "node_modules"
+            || file_name == "downloads"
+            || file_name == "cache.json"
+            || file_name.starts_with(".")
+        {
+            // Also skip dotfiles for now unless explicitly needed
+            continue;
+        }
+
+        let dest_path = output_project_dir.join(file_name);
+
+        if path.is_dir() {
+            fs::create_dir_all(&dest_path)?;
+            // Use fs_extra::dir::copy for recursive directory copying
+            // Ensure options are set correctly for subdirectories if needed
+            let mut sub_copy_options = CopyOptions::new();
+            sub_copy_options.overwrite = true;
+            copy(&path, &dest_path, &sub_copy_options).map_err(|e| {
+                format!(
+                    "Failed to copy directory {:?} to {:?}: {}",
+                    path, dest_path, e
+                )
+            })?;
+            println!("  Copied directory: {:?} -> {:?}", path, dest_path);
+        } else {
+            fs::copy(&path, &dest_path)
+                .map_err(|e| format!("Failed to copy file {:?} to {:?}: {}", path, dest_path, e))?;
+        }
+    }
+    // --- END TEMPORARY REPLACEMENT ---
+
+    // --- Fill Template ---
+    println!(
+        "Step 7: Populating template '{:?}'...",
+        output_project_dir.join("index.ts")
+    );
+    let template_index_path = output_project_dir.join("index.ts");
+    let template_content = fs::read_to_string(&template_index_path)?;
+
+    // Replace placeholders
+    let final_content = template_content
+        .replace("__START_URL__", &initial_url)
+        .replace("// __ACTION_SEQUENCE__", &action_sequence); // Replace the comment line
+
+    fs::write(&template_index_path, final_content)?;
 
     let duration = start_time.elapsed();
     println!("Conversion completed in {:?}", duration);
-    println!("Script saved to: {:?}", output_path);
+    println!("Stagehand project created at: {:?}", output_project_dir);
+    println!(
+        "To run: cd {:?} && npm install && npm run start",
+        output_project_dir
+    );
 
     Ok(())
 }
 
-async fn convert_rrweb_to_script(rrweb_json_path: &str) -> Result<String, Box<dyn Error>> {
+async fn convert_rrweb_to_script(
+    rrweb_json_path: &str,
+) -> Result<(String, String), Box<dyn Error>> {
+    // Returns (initial_url, action_sequence_string)
     // Load the recording data
     println!("Step 1: Loading rrweb events...");
     let rrweb_events = load_json_from_file(rrweb_json_path)?;
     println!("Loaded {} events.", rrweb_events.len());
 
-    // Extract initial metadata (like starting URL) - Placeholder
-    // let meta_event = find_event_by_type(&rrweb_events, 4); // Type 4 is Meta
-    let initial_url = "http://example.com"; // Placeholder URL
-    println!("Initial URL (placeholder): {}", initial_url);
+    // Extract initial metadata (like starting URL)
+    let initial_url = find_event_by_type(&rrweb_events, 4) // Type 4 is Meta
+        .and_then(|event| event.data.get("href"))
+        .and_then(|href| href.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            eprintln!("Warning: Could not find initial URL (Meta event type 4 with href). Using placeholder.");
+            "http://example.com".to_string()
+        });
+    println!("Initial URL: {}", initial_url);
 
     // --- Stage 1: Pre-processing and Action Extraction ---
     println!("Step 2: Pre-processing and extracting actions...");
@@ -126,10 +237,10 @@ async fn convert_rrweb_to_script(rrweb_json_path: &str) -> Result<String, Box<dy
     let actions_with_selectors = generate_selectors_for_actions(&simplified_actions, &dom_map)?;
 
     // --- Stage 3: Code Generation ---
-    println!("Step 4: Generating TypeScript Playwright code...");
-    let automation_script = generate_automation_code(&actions_with_selectors, initial_url).await?;
+    println!("Step 4: Generating action sequence code...");
+    let action_sequence = generate_action_sequence_code(&actions_with_selectors).await?;
 
-    Ok(automation_script)
+    Ok((initial_url, action_sequence)) // Return both URL and action string
 }
 
 // --- Utility/Placeholder Functions ---
@@ -265,7 +376,7 @@ fn preprocess_rrweb_data(
             if let Some(source_type) = event.data.get("source").and_then(|v| v.as_i64()) {
                 match source_type {
                     0 => { // Mutation
-                        // update_dom_map(&mut dom_map, &event.data); // TODO: Implement this
+                         // update_dom_map(&mut dom_map, &event.data); // TODO: Implement this
                     }
                     2 => {
                         // Mouse Interaction
@@ -440,52 +551,43 @@ fn generate_selectors_for_actions(
     Ok(actions_with_selectors)
 }
 
-// --- Stage 3 Helper Function (Placeholder) ---
-async fn generate_automation_code(
+// --- Stage 3 Helper Function ---
+// Generates the sequence of TypeScript Playwright/Stagehand action lines
+async fn generate_action_sequence_code(
     actions_with_selectors: &[ActionWithSelector],
-    initial_url: &str,
 ) -> Result<String, Box<dyn Error>> {
-    // Use standard TypeScript Playwright structure
-    let mut generated_code = String::new();
+    let mut action_sequence_code = String::new();
 
-    // Add imports
-    generated_code.push_str("import { test, expect } from '@playwright/test';\n\n");
+    // Prepend standard cookie consent dismissal
+    action_sequence_code.push_str("  // Attempt to dismiss common cookie banners first\n");
+    // Use getByRole with a regex for common button texts and a short timeout.
+    // Add a .catch() to ignore errors if the button isn't found.
+    action_sequence_code.push_str("  await page.getByRole('button', { name: /Accept|Agree|Allow|Got it/i }).click({ timeout: 5000 }).catch(() => { console.log('Cookie banner not found or dismissed already within 5s.'); });\n\n");
 
-    // Add test block
-    generated_code.push_str("test('Generated from rrweb recording', async ({ page }) => {\n");
-
-    // Add initial navigation
-    // Escape backticks and quotes in URL for TS template literals/strings
-    let escaped_initial_url = initial_url.replace('`', "\\`").replace('"', "\\\"");
-    generated_code.push_str(&format!(
-        "  await page.goto(\"{}\");\n\n",
-        escaped_initial_url
-    ));
-
-    // Loop through actions and generate code
+    // Loop through actions and generate code lines
     for action in actions_with_selectors {
-        // Add timestamp comment
-        generated_code.push_str(&format!("  // Timestamp: {}\n", action.timestamp));
+        // Add timestamp comment (indented)
+        action_sequence_code.push_str(&format!("  // Timestamp: {}\n", action.timestamp));
 
-        // Add comment describing the action
-        generated_code.push_str(&format!(
+        // Add comment describing the action (indented)
+        action_sequence_code.push_str(&format!(
             "  // Action: {:?}, Selector: '{}'",
             action.action_type, action.selector
         ));
         if let Some(val) = &action.value {
-            generated_code.push_str(&format!(", Value: '{}'", val));
+            action_sequence_code.push_str(&format!(", Value: '{}'", val));
         }
-        generated_code.push_str("\n"); // Use push_str for consistency
+        action_sequence_code.push_str("\n");
 
-        // Add actual code generation based on type
+        // Add actual code generation (indented)
         match action.action_type {
             ActionType::Click => {
                 let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
-                generated_code.push_str(&format!(
+                action_sequence_code.push_str(&format!(
                     "  await page.locator(\"{}\").click();",
                     escaped_selector
                 ));
-                generated_code.push_str("\n");
+                action_sequence_code.push_str("\n");
             }
             ActionType::Input => {
                 if let Some(val) = &action.value {
@@ -501,38 +603,27 @@ async fn generate_automation_code(
                             .all(|c| c.is_ascii_alphanumeric() || c == '=' || c == '+' || c == '/');
 
                     if is_obscured {
-                        generated_code.push_str(
+                        action_sequence_code.push_str(
                             "  // Input value seems obscured/masked, using placeholder:\n",
                         );
-                        generated_code.push_str(&format!(
+                        action_sequence_code.push_str(&format!(
                             "  await page.locator(\"{}\").fill(\"TODO: Add realistic test data\");",
                             escaped_selector
                         ));
                     } else {
-                        generated_code.push_str(&format!(
+                        action_sequence_code.push_str(&format!(
                             "  await page.locator(\"{}\").fill(\"{}\");",
                             escaped_selector, escaped_value
                         ));
                     }
-                    generated_code.push_str("\n");
+                    action_sequence_code.push_str("\n");
                 }
             }
         }
-        generated_code.push_str("\n"); // Add blank line between actions
+        action_sequence_code.push_str("\n"); // Add blank line between actions
     }
 
-    // Add placeholder for assertions or final actions
-    generated_code.push_str(
-        "  // Example assertion (optional):
-",
-    );
-    generated_code
-        .push_str("  // await expect(page.locator(\'body\')).toContainText(\'Success!\');\n\n");
-
-    // Close test block
-    generated_code.push_str("});\n");
-
-    Ok(generated_code)
+    Ok(action_sequence_code.trim_end().to_string()) // Trim trailing whitespace/newlines
 }
 
 // --- Other Utility Placeholders ---
