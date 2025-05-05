@@ -533,16 +533,19 @@ fn generate_selectors_for_actions(
                 }
             }
 
-            // Fallback Strategy: If no preferred selector found, use tag + rrweb_id
+            // Fallback Strategy: If no preferred selector found, mark as failed.
             if !selector_found {
-                if let Some(tag) = &node_info.tag_name {
-                    generated_selector = format!("{}[rrweb_id=\"{}\"]", tag, action.rrweb_id);
-                } else {
-                    generated_selector = format!("*[rrweb_id=\"{}\"]", action.rrweb_id);
-                    // If even tag is missing
-                }
+                let tag_name = node_info.tag_name.as_deref().unwrap_or("unknown");
+                // Use a specific prefix to identify failed selectors later
+                generated_selector = format!("SELECTOR_GENERATION_FAILED::{}", tag_name);
             }
-        } // If node_info is None, keep the default placeholder
+        } else {
+            // If node_info is None (shouldn't happen often if preprocessing is robust)
+            generated_selector = format!(
+                "SELECTOR_GENERATION_FAILED::node_not_found_id_{}",
+                action.rrweb_id
+            );
+        } // Keep the default placeholder if node_info is None
 
         actions_with_selectors.push(ActionWithSelector {
             action_type: action.action_type.clone(),
@@ -585,43 +588,67 @@ async fn generate_action_sequence_code(
         action_sequence_code.push('\n');
 
         // Add actual code generation (indented)
-        match action.action_type {
-            ActionType::Click => {
-                let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
-                action_sequence_code.push_str(&format!(
-                    "  await page.locator(\"{}\").click();",
-                    escaped_selector
-                ));
-                action_sequence_code.push('\n');
-            }
-            ActionType::Input => {
-                if let Some(val) = &action.value {
+        if action.selector.starts_with("SELECTOR_GENERATION_FAILED::") {
+            // If selector generation failed, add a comment and skip the action command
+            let failed_tag = action
+                .selector
+                .split("::")
+                .nth(1)
+                .unwrap_or("unknown_element");
+            action_sequence_code.push_str(&format!(
+                "  // Action skipped: Could not generate stable selector for <{}> element.\n",
+                failed_tag
+            ));
+        } else {
+            // If selector exists, generate the command wrapped in try...catch
+            match action.action_type {
+                ActionType::Click => {
                     let escaped_selector = action.selector.replace('`', "\\`").replace('"', "\\\"");
-                    let escaped_value = val
-                        .replace('\\', "\\\\")
-                        .replace('`', "\\`")
-                        .replace('"', "\\\"");
+                    // Remove the explicit waitForSelector, rely on action timeout + try/catch
+                    action_sequence_code.push_str("  try {\n");
+                    action_sequence_code.push_str(&format!(
+                        "    await page.locator(\"{}\").click();\n",
+                        escaped_selector
+                    ));
+                    action_sequence_code.push_str("  } catch (error) {\n");
+                    action_sequence_code.push_str(&format!(
+                        "    console.warn('Action failed for selector [{}]:', error.message);\n",
+                        escaped_selector.replace('\\', " ")
+                    )); // Log cleaner selector
+                    action_sequence_code.push_str("  }\n");
+                }
+                ActionType::Input => {
+                    if let Some(val) = &action.value {
+                        let escaped_selector =
+                            action.selector.replace('`', "\\`").replace('"', "\\\"");
+                        let escaped_value = val
+                            .replace('\\', "\\\\")
+                            .replace('`', "\\`")
+                            .replace('"', "\\\"");
 
-                    let is_obscured = val.len() > 20
-                        && val
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '=' || c == '+' || c == '/');
+                        // Remove the explicit waitForSelector
 
-                    if is_obscured {
-                        action_sequence_code.push_str(
-                            "  // Input value seems obscured/masked, using placeholder:\n",
-                        );
-                        action_sequence_code.push_str(&format!(
-                            "  await page.locator(\"{}\").fill(\"TODO: Add realistic test data\");",
-                            escaped_selector
-                        ));
-                    } else {
-                        action_sequence_code.push_str(&format!(
-                            "  await page.locator(\"{}\").fill(\"{}\");",
-                            escaped_selector, escaped_value
-                        ));
+                        let is_obscured = val.len() > 20
+                            && val.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || c == '=' || c == '+' || c == '/'
+                            });
+
+                        action_sequence_code.push_str("  try {\n");
+                        if is_obscured {
+                            action_sequence_code.push_str(
+                                "    // Input value seems obscured/masked, using placeholder:\n",
+                            );
+                            action_sequence_code.push_str(&format!("    await page.locator(\"{}\").fill(\"TODO: Add realistic test data\");\n", escaped_selector));
+                        } else {
+                            action_sequence_code.push_str(&format!(
+                                "    await page.locator(\"{}\").fill(\"{}\");\n",
+                                escaped_selector, escaped_value
+                            ));
+                        }
+                        action_sequence_code.push_str("  } catch (error) {\n");
+                        action_sequence_code.push_str(&format!("    console.warn('Action failed for selector [{}]:', error.message);\n", escaped_selector.replace('\\', ""))); // Log cleaner selector
+                        action_sequence_code.push_str("  }\n");
                     }
-                    action_sequence_code.push('\n');
                 }
             }
         }
