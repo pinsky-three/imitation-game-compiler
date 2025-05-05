@@ -612,7 +612,7 @@ async fn generate_action_sequence_code(
                     ));
                     action_sequence_code.push_str("  } catch (error) {\n");
                     action_sequence_code.push_str(&format!(
-                        "    console.warn('Action failed for selector [{}]:', error.message);\n",
+                        "    console.warn('Action failed for selector [{}]:', (error as Error).message);\n",
                         escaped_selector.replace('\\', " ")
                     )); // Log cleaner selector
                     action_sequence_code.push_str("  }\n");
@@ -646,7 +646,7 @@ async fn generate_action_sequence_code(
                             ));
                         }
                         action_sequence_code.push_str("  } catch (error) {\n");
-                        action_sequence_code.push_str(&format!("    console.warn('Action failed for selector [{}]:', error.message);\n", escaped_selector.replace('\\', ""))); // Log cleaner selector
+                        action_sequence_code.push_str(&format!("    console.warn('Action failed for selector [{}]:', (error as Error).message);\n", escaped_selector.replace('\\', ""))); // Log cleaner selector
                         action_sequence_code.push_str("  }\n");
                     }
                 }
